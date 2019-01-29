@@ -13,7 +13,7 @@ single C file of less than 500 lines). Being so simple, it's also pretty
 quick, even in pure C without multithreading. Possible uses:
 
 1. Learning how lossless audio compressors work.
-2. Easily Incorporating lossless audio compression into other apps.
+2. Easily incorporating lossless audio compression into other apps.
 3. Implementing lossless audio compression on limited resource systems, or
    even hardware.
 
@@ -24,3 +24,54 @@ concatenation of the generated blocks and provide no metadata storage,
 no error detection, and no seeking capability. The format COULD be used
 inside of another container format like Matroska, but I'm not sure that
 would have any value.
+
+To build the demo app:
+
+    $ gcc -O2 *.c -o slac
+
+The "help" display from the demo app:
+
+ Usage:     SLAC [-options] infile.wav outfile.slac
+            SLAC -d [-options] infile.slac outfile.wav
+
+ Pipes:     specify '-' for filename, but not WAV output
+
+ Options:  -d     = decode operation (default = encode))
+           -bn    = override block samples (default = 1024)
+           -h     = display this help message
+           -j0    = encode stereo files as L/R
+           -j1    = encode stereo files as M/S (default)
+           -j2    = encode stereo files using best (slow)
+           -q     = quiet mode (display errors only)
+           -r     = raw output (no WAV header written)
+           -v     = verbose (display lots of info)
+           -y     = overwrite outfile if it exists
+
+
+The compression algorithm uses only standard techniques, but carefully:
+
+1. The audio data samples are divided into blocks. By default these are 1024
+   samples but can be essentially any size (there are trade-offs) and this
+   step is actually done by the client of the library.
+
+2. For stereo data, a check is made for identical channels (dual-mono),
+   otherwise the data is optionally converted to mid-side (which on average
+   compresses better), or simply left as left-right.
+
+3. The data is scanned for redundant LSB zeros, and if these are found in
+   all samples a right-shift is performed to reduce the sample magnitude. The
+   size of the shift is stored in the output bitstream so that the samples can
+   be left-shifted at decode.
+
+4. The decorrelation method is simply pure deltas (i.e. each sample is
+   replaced with the difference between it and the previous sample). This is
+   repeated in passes and the resulting magnitude checked until the optimum
+   number of passes is determined. This value (from -1 to 6) is stored with
+   the audio and used on decode to re-correlate the audio samples. Note that
+   the -1 value is for cases where the samples are negatively correlated
+   (rare in music but possible in test cases).
+
+5. The signed samples are converted to a nonnegative integer representation
+   (with the sign in the LSB) and these are encoded with standard Rice codes.
+   The optimum Golomb-Rice parameter k is determined by trial from just the
+   sum of the values to be encoded.
