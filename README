@@ -1,0 +1,26 @@
+////////////////////////////////////////////////////////////////////////////
+//                           ****** SLAC ******                           //
+//                    Simple Lossless Audio Compressor                    //
+//                    Copyright (c) 2019 David Bryant.                    //
+//                          All Rights Reserved.                          //
+//      Distributed under the BSD Software License (see license.txt)      //
+////////////////////////////////////////////////////////////////////////////
+
+A very simple lossless audio compressor. Designed to achieve about the same
+compression as flac -0 or shorten with the absolute minimum amount of
+complexity (in fact, the entire library for both encoding and decoding is a
+single C file of less than 500 lines). Being so simple, it's also pretty
+quick, even in pure C without multithreading. Possible uses:
+
+1. Learning how lossless audio compressors work.
+2. Easily Incorporating lossless audio compression into other apps.
+3. Implementing lossless audio compression on limited resource systems, or
+   even hardware.
+
+It's important to note that this is NOT a new lossless audio compression
+file format! There is a simple command-line front end for demo purposes
+that works with WAV files, but the resulting SLAC files are simply a
+concatenation of the generated blocks and provide no metadata storage,
+no error detection, and no seeking capability. The format COULD be used
+inside of another container format like Matroska, but I'm not sure that
+would have any value.
