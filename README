@@ -48,7 +48,7 @@ The "help" display from the demo app:
            -y     = overwrite outfile if it exists
 
 
-The compression algorithm uses only standard techniques, but carefully:
+The compression algorithm uses only standard techniques:
 
 1. The audio data samples are divided into blocks. By default these are 1024
    samples but can be essentially any size (there are trade-offs) and this
@@ -74,4 +74,6 @@ The compression algorithm uses only standard techniques, but carefully:
 5. The signed samples are converted to a nonnegative integer representation
    (with the sign in the LSB) and these are encoded with standard Rice codes.
    The optimum Golomb-Rice parameter k is determined by trial from just the
-   sum of the values to be encoded.
+   sum of the values to be encoded. The first few un-decorrelated samples are
+   encoded with their own Rice parameter because they often have wildly
+   different magnitudes that the majority of the samples.

@@ -11,7 +11,7 @@
 // This module provides functions to compress and decompress PCM integer
 // audio. The audio is presented in 32-bit integers, but can be arbitrary
 // bitdepths (redundant bits at either side of the words are handled). Mono
-// and stereo streams are supported and up to significant 24-bits per sample
+// and stereo streams are supported and up to 24 significant bits per sample
 // (anywhere in the 32-bit word).
 //
 // No allocation is used; everything is done in place using the passed input
@@ -32,12 +32,12 @@
 
 typedef int64_t slac_mag_t;
 
-// These complementary macros convert from signed integers into the positive
+// These complementary macros convert from signed integers into the non-negative
 // values that slac uses for analysis and entropy encoding (with the sign moved
 // to the LSB), and back.
 
-#define signed_to_positive(x)   (((x)<<1)^((int32_t)(x)>>31))
-#define positive_to_signed(x)   ((((x)&1)?~(x):(x))>>1)
+#define signed_to_non_negative(x)   (((x)<<1)^((int32_t)(x)>>31))
+#define non_negative_to_signed(x)   ((((x)&1)?~(x):(x))>>1)
 
 #define MAX_DECORR 6
 
@@ -60,12 +60,17 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count);
 // into the provided buffer (which should be big enough for the data). The
 // return value is the number of bytes used (rounded up to the next word) or
 // -1 indicating an error. The stereo_mode only applies if num_chans is 2
-// (obviously) and can be either MID_SIDE or LEFT_RIGHT (see libslac.h).
+// (obviously) and can be either MID_SIDE or LEFT_RIGHT (see libslac.h). Note
+// that selecting the better of left-right and mid-side encoding is not done
+// here, but can easily be done at the next higher level by simply performing
+// this operation for both methods and choosing the smaller.
 
 int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize)
 {
     int sent_chans = num_chans, chan;
     Bitstream bs;
+
+    // this is the processing unique to stereo...from here on it's just 1 or 2 mono channels
 
     if (num_chans == 2) {
         if (channels_identical (audio_samples, sample_count)) {
@@ -80,22 +85,36 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
     else
         stereo_mode = MONO_MODE;
 
+    // open the bitstream for writing and store the stereo mode in the first two bits
+
     bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
     putbits (stereo_mode, 2, &bs);
+
+    // the channels (1 or 2) are processed completely independently and sequentially here
 
     for (chan = 0; chan < sent_chans; ++chan) {
         int shift, decorr;
 
+        // check whether there are LSB zeros in every sample that can be shifted out
+
         shift = redundant_bits (audio_samples + chan, sample_count, num_chans);
         shifts [shift]++;
-        decorr = best_decorr (audio_samples + chan, sample_count, num_chans);
-        decorrs [decorr + 1]++;
-        putbits (decorr + 1, 3, &bs);
 
+        // find the best decorrelator (from -1 to 6) and write that to the stream in 3 bits
+
+        decorr = best_decorr (audio_samples + chan, sample_count, num_chans);
+        putbits (decorr + 1, 3, &bs);
+        decorrs [decorr + 1]++;
+
+        // since the shift amount is generally small, store that in unary (1's followed by 0)
         while (shift--)
             putbit_1 (&bs);
 
         putbit_0 (&bs);
+
+        // because the magnitude of the first few samples can be very different than the rest
+        // of the data (because they're not as decorrelated), we store those using their own
+        // Rice parameter; this only costs 5 bits per channel, but can make a huge improvement
 
         if (decorr && abs (decorr) < sample_count) {
             entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans);
@@ -105,7 +124,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
             entropy_encode (&bs, audio_samples + chan, sample_count, num_chans);
     }
 
-    return bs_close_write (&bs);
+    return bs_close_write (&bs);    // close the bitstream and return the number of bytes written
 }
 
 static int best_base (int32_t *audio_samples, int sample_count, int stride);
@@ -126,7 +145,7 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
     uint32_t mask = (1 << base) - 1;
 
     while (sample_count--) {
-        uint32_t avalue = signed_to_positive (*audio_samples);
+        uint32_t avalue = signed_to_non_negative (*audio_samples);
         int modulo = avalue >> base;
 
         while (modulo--)
@@ -143,10 +162,13 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
     }
 }
 
-// Calculate the optimum base (i.e. number of bits sent literally) for the
-// supplied sample data. This requires a variable type with greater than
-// 32 bits of magnitude (not resolution), so this can be either a 32-bit
-// float or a 64-bit integer, whichever is better for the platform.
+// Calculate the optimum base (i.e. number of bits sent literally, sometimes
+// denoted as k for Rice encoding) for the supplied sample data. This requires
+// a variable type with greater than 32 bits of magnitude (not resolution)
+// because we calculate the sum of all the samples. This can be either a 32-bit
+// float or a 64-bit integer, whichever is better for the platform (see typedef
+// above). Fortunately, this is only done a few times per block, so should not
+// be a huge time contributor.
 
 static int best_base (int32_t *audio_samples, int sample_count, int stride)
 {
@@ -155,14 +177,18 @@ static int best_base (int32_t *audio_samples, int sample_count, int stride)
     int32_t *dptr = audio_samples;
 
     while (count--) {
-        avalue_sum += signed_to_positive (*dptr);
+        avalue_sum += signed_to_non_negative (*dptr);
         dptr += stride;
     }
 
     min_bits = avalue_sum + sample_count;
 
+    // min_bits this is now the exact total number of bits used for encoding the
+    // samples with k=0; next we'll increase k and estimate the resulting bit
+    // count as long as it continues to improve
+
     while (1) {
-        slac_mag_t bits = (avalue_sum /= 2) + (++base * sample_count) + (sample_count / 2);
+        slac_mag_t bits = (avalue_sum /= 2) + (++base * sample_count) + sample_count - (sample_count / 6);
 
         if (bits < min_bits)
             min_bits = bits;
@@ -173,7 +199,9 @@ static int best_base (int32_t *audio_samples, int sample_count, int stride)
 
 // Scan sample array for redundant LSB's (zeros) and remove them through a
 // shift. The number of bits removed is returned so that the samples can be
-// correctly reconstructed on decode.
+// correctly reconstructed on decode. This should not normally be time-
+// consuming because we break out as soon as we see the LSB set (which would
+// normally be very early, unless we are really going to have success).
 
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
 {
@@ -212,22 +240,24 @@ static int magnitude_bits (int32_t *audio_samples, int sample_count, int stride)
     int bits = sample_count * 31;
 
     for (dptr = audio_samples; dptr < eptr; dptr += stride)
-        bits -= __builtin_clz (signed_to_positive (*dptr) + 1);
+        bits -= __builtin_clz (signed_to_non_negative (*dptr) + 1);
 
     return bits;
 }
 
 // Given an array of samples, determine the best decorrelation level (or count)
-// the produces the smallest output, and leave the data decorrelated to that
+// that produces the smallest output, and leave the data decorrelated to that
 // level so that it can be immediately entropy encoded. If even the first level
 // of decorrelation shows degradation then we try correlation() to see if that
-// helps. Negative correlation would not normally be seen in regular audio, but
-// might be seen in test signals, and it kind of comes free here.
+// helps instead. Negative correlation would not normally be seen in regular
+// audio, but might be seen in test signals, and it kind of comes free here.
 
 static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
 {
     int best_magnitude = magnitude_bits (audio_samples, sample_count, stride);
     int decorr_index = 0, best_decorr_index = 0;
+
+    // first, continue to call decorrelate() until the result gets worse, then back up 1
 
     while (decorr_index < MAX_DECORR) {
         int magnitude = decorrelate (audio_samples, sample_count, stride); decorr_index++;
@@ -241,6 +271,8 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
             break;
         }
     }
+
+    // if that didn't work at all, maybe negative decorrelation (i.e. correlation) will
 
     if (decorr_index == 0) {
         int magnitude = correlate (audio_samples, sample_count, stride); decorr_index--;
@@ -406,7 +438,7 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
             avalue |= (base_bits & mask);
         }
 
-        *audio_samples = positive_to_signed (avalue);
+        *audio_samples = non_negative_to_signed (avalue);
         audio_samples += stride;
     }
 }
@@ -484,7 +516,7 @@ static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
 
     while (sample_count--) {
         temp += *audio_samples -= temp;
-        bits -= __builtin_clz (signed_to_positive (*audio_samples) + 1);
+        bits -= __builtin_clz (signed_to_non_negative (*audio_samples) + 1);
         audio_samples += stride;
     }
 
@@ -498,7 +530,7 @@ static int correlate (int32_t *audio_samples, int sample_count, int stride)
 
     while (sample_count--) {
         value = *audio_samples += value;
-        bits -= __builtin_clz (signed_to_positive (value) + 1);
+        bits -= __builtin_clz (signed_to_non_negative (value) + 1);
         audio_samples += stride;
     }
 
