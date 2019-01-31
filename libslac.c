@@ -65,6 +65,8 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count);
 // here, but can easily be done at the next higher level by simply performing
 // this operation for both methods and choosing the smaller.
 
+// Note: the audio samples are processed in place, they are not "const" !!
+
 int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize)
 {
     int sent_chans = num_chans, chan;
@@ -138,10 +140,10 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
 {
     int base = best_base (audio_samples, sample_count, stride);
 
-    if (sample_count > MAX_DECORR)
+    if (sample_count > MAX_DECORR)  // only count the "real" blocks in the statistics
         bases [base]++;
 
-    putbits (base, 5, bs);
+    putbits (base, 5, bs);          // the Rice k parameter is stored in the first 5 bits
     uint32_t mask = (1 << base) - 1;
 
     while (sample_count--) {
@@ -205,10 +207,8 @@ static int best_base (int32_t *audio_samples, int sample_count, int stride)
 
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
 {
-    int redundant_bits = 0;
-
+    int count = sample_count, redundant_bits;
     int32_t *dptr = audio_samples;
-    int count = sample_count;
     int32_t ordata = 0;
 
     while (count--)
@@ -229,10 +229,11 @@ static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
 }
 
 // Scan a buffer of sample data and return an estimated "magnitude" value
-// based on the first significant bit of the absolute value of each sample.
+// based on the most significant 1 bit of the absolute value of each sample.
 // There is no real significance to this number because it is simply used to
 // compare arrays with different decorrelation processing. This should match
-// the value returned by decorrelate() and correlate().
+// the value returned by decorrelate() and correlate(). We add 1 because
+// __builtin_clz() is undefined for zero input.
 
 static int magnitude_bits (int32_t *audio_samples, int sample_count, int stride)
 {
@@ -248,7 +249,7 @@ static int magnitude_bits (int32_t *audio_samples, int sample_count, int stride)
 // Given an array of samples, determine the best decorrelation level (or count)
 // that produces the smallest output, and leave the data decorrelated to that
 // level so that it can be immediately entropy encoded. If even the first level
-// of decorrelation shows degradation then we try correlation() to see if that
+// of decorrelation shows degradation, then we try correlation() to see if that
 // helps instead. Negative correlation would not normally be seen in regular
 // audio, but might be seen in test signals, and it kind of comes free here.
 
@@ -366,21 +367,25 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     int read_chans = num_chans, res = 0, stereo_mode, chan;
     Bitstream bs;
 
+    // open the passed buffer as a bitstream and get the first 2 bits (stereo mode)
+
     bs_open_read (&bs, inbuffer, inbuffer + inbufsize);
     getbits (&stereo_mode, 2, &bs);
     stereo_mode &= 0x3;
 
-    if (stereo_mode == DUAL_MONO)
+    if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
 
     for (chan = 0; chan < read_chans && !bs.error; ++chan) {
         int shift = 0, decorr;
 
-        getbits (&decorr, 3, &bs);
+        getbits (&decorr, 3, &bs);      // the first 3 bits for each channel is the decorrelation info
         decorr = (decorr & 0x7) - 1;
 
-        while (getbit (&bs))
+        while (getbit (&bs))            // the number of 1's that follow is the final left-shift amount
             shift++;
+
+        // as with encoding, we read the first few still correlated samples in a separate Rice operation
 
         if (decorr && abs (decorr) < sample_count) {
             entropy_decode (&bs, audio_samples + chan, abs (decorr), num_chans);
@@ -388,6 +393,8 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
         }
         else
             entropy_decode (&bs, audio_samples + chan, sample_count, num_chans);
+
+        // next undo the decorrelation step, and finally the shift
 
         if (decorr < 0)
             decorrelate (audio_samples + chan, sample_count, num_chans);
@@ -400,12 +407,14 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
             leftshift_bits (audio_samples + chan, sample_count, num_chans, shift);
     }
 
+    // if stereo and not simply stored left-right, we might have one more step
+
     if (stereo_mode == MID_SIDE)
         ms_to_lr (audio_samples, sample_count);
     else if (stereo_mode == DUAL_MONO)
         dm_to_lr (audio_samples, sample_count);
 
-    res = bs.error;
+    res = bs.error;         // if we went past the end of the buffer, flag an error
     bs_close_read (&bs);
 
     return res;
@@ -415,7 +424,7 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 // If stereo data is being decompressed the channels are processed sequentially
 // and the stride parameter should be 2 and the pointer set to the first sample
 // of the desired channel. The first 5 bits are the Rice "base" value which
-// specifies how many bits are sent literally.
+// specifies how many bits are sent literally (sometimes called k).
 
 static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
 {
@@ -465,10 +474,8 @@ static void dm_to_lr (int32_t *audio_samples, int sample_count)
     }
 }
 
-// Converts the supplied buffer of stereo samples from mid-side encoding to
-// left-right encoding. Note that since L+R and L-R have identical LSBs, we
-// don't really need to store the LSB of both, which is why it's "mid" instead
-// of "sum".
+// Converts the supplied buffer of stereo samples from mid-side encoding back
+// to left-right encoding.
 
 static void ms_to_lr (int32_t *audio_samples, int sample_count)
 {
@@ -486,8 +493,8 @@ static void ms_to_lr (int32_t *audio_samples, int sample_count)
 
 static void correlate_factor (int32_t *audio_samples, int sample_count, int stride, int factor)
 {
-    int32_t *fptr = audio_samples + (sample_count + factor) * stride;
-    int32_t *eptr = audio_samples + sample_count * stride;
+    const int32_t *fptr = audio_samples + (sample_count + factor - 1) * stride;
+    const int32_t *eptr = audio_samples + sample_count * stride;
     int32_t *dptr, *aptr, i;
 
     for (dptr = audio_samples + stride; dptr < fptr; dptr += stride)
@@ -505,9 +512,10 @@ static void correlate_factor (int32_t *audio_samples, int sample_count, int stri
 // called correlation, each sample is replaced by the sum of itself and all
 // the previous samples. The first sample is never changed. Each function
 // exactly undoes the operation of the other, which is why they can be used
-// for lossless compression. So that they can be used on the encoder side,
-// they also calculate and return a "magnitude" value identical to the
-// value returned by magnitude_bits().
+// for lossless compression. So that they can be used during the encoder side
+// analysis, they also calculate and return a "magnitude" value identical to
+// the value returned by magnitude_bits() that can be used to determine if
+// the operation reduced the average magnitude of the samples.
 
 static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
 {
