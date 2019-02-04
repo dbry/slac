@@ -27,7 +27,7 @@
 #include "libslac.h"
 
 static const char *sign_on = "\n"
-" SLAC  Simple Lossless Audio Compressor Demo  Version 0.1\n"
+" SLAC  Simple Lossless Audio Compressor Demo  Version 0.2\n"
 " Copyright (c) 2019 David Bryant. All Rights Reserved.\n\n";
 
 static const char *usage =
@@ -478,8 +478,8 @@ static int encode_slac (FILE *infile, FILE *outfile, size_t total_samples, int n
     if (!quiet_mode) {
         size_t source_bytes = (total_samples - samples_left) * num_chans * bytes_per_sample;
 
-        fprintf (stderr, "compressed %d blocks, of %d %s %d-bit samples each, into %zu bytes\n",
-            block_count, block_samples, num_chans == 2 ? "stereo" : "mono", bytes_per_sample * 8, total_bytes);
+        fprintf (stderr, "compressed %d blocks, each containing %d %d-bit %s samples, into %zu bytes\n",
+            block_count, block_samples, bytes_per_sample * 8, num_chans == 2 ? "stereo" : "mono", total_bytes);
         fprintf (stderr, "overall compression ratio was %.2f%%, or %.2f bits per sample\n",
             total_bytes * 100.0 / source_bytes, total_bytes * 8.0 / num_chans / (total_samples - samples_left));
     }
