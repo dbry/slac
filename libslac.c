@@ -145,27 +145,32 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
 
     putbits (rice_k + 1, 5, bs);    // the Rice k parameter (offset 1) is stored in the first 5 bits
 
-    if (rice_k == -1)               // if -1, there's only silence, so we're done
-        return;
+    if (rice_k > 0) {
+        uint32_t mask = (1 << rice_k) - 1;
 
-    uint32_t mask = (1 << rice_k) - 1;
+        while (sample_count--) {
+            uint32_t avalue = signed_to_non_negative (*audio_samples);
+            int modulo = avalue >> rice_k;
 
-    while (sample_count--) {
-        uint32_t avalue = signed_to_non_negative (*audio_samples);
-        int modulo = avalue >> rice_k;
+            while (modulo--)
+                putbit_1 (bs);
 
-        while (modulo--)
-            putbit_1 (bs);
-
-        putbit_0 (bs);
-
-        if (rice_k) {
+            putbit_0 (bs);
             avalue &= mask;
             putbits (avalue, rice_k, bs);
+            audio_samples += stride;
         }
-
-        audio_samples += stride;
     }
+    else if (rice_k == 0)
+        while (sample_count--) {
+            uint32_t avalue = signed_to_non_negative (*audio_samples);
+
+            while (avalue--)
+                putbit_1 (bs);
+
+            putbit_0 (bs);
+            audio_samples += stride;
+        }
 }
 
 // Calculate the optimum Rice k parameter (i.e. number of bits sent literally
