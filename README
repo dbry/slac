@@ -12,8 +12,10 @@ complexity (in fact, the entire library for both encoding and decoding is a
 single C file of less than 500 lines). Being so simple, it's also pretty
 quick, even in pure C without multithreading. Possible uses:
 
-1. Learning how lossless audio compressors work.
-2. Easily incorporating lossless audio compression into other apps.
+1. Learning how lossless audio compressors work, or the starting point for
+   your own lossless codec experiments.
+2. Easily incorporating lossless audio compression into other apps, perhaps
+   even including translation into another language.
 3. Implementing lossless audio compression on limited resource systems, or
    even hardware.
 
@@ -76,4 +78,5 @@ The compression algorithm uses only standard techniques:
    The optimum Golomb-Rice parameter k is determined by trial from just the
    sum of the values to be encoded. The first few un-decorrelated samples are
    encoded with their own Rice parameter because they often have wildly
-   different magnitudes that the majority of the samples.
+   different magnitudes than the majority of the samples. Also, a check is
+   made for all the samples being zero, in which case nothing is encoded.
