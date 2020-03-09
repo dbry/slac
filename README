@@ -6,6 +6,13 @@
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
 
+Update: Since I developed and named this codec I have been made aware of a
+        proprietary audio compression algorithm from Texas Instruments for
+        its CC85xx line of chips (and perhaps others) also called SLAC
+        (Slightly Lossy Audio Codec). There is no relation between the two
+        codecs (mine is completely original and neither lossy nor
+        proprietary). I apologize for any confusion.
+
 A very simple lossless audio compressor. Designed to achieve about the same
 compression as flac -0 or shorten with the absolute minimum amount of
 complexity (in fact, the entire library for both encoding and decoding is a
