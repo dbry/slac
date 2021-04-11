@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////
 //                           ****** SLAC ******                           //
 //                    Simple Lossless Audio Compressor                    //
-//                    Copyright (c) 2019 David Bryant.                    //
+//                 Copyright (c) 2019 - 2021 David Bryant                 //
 //                          All Rights Reserved.                          //
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
@@ -36,8 +36,8 @@ typedef int64_t slac_mag_t;
 // values that slac uses for analysis and entropy encoding (with the sign moved
 // to the LSB), and back.
 
-#define signed_to_non_negative(x)   (((x)<<1)^((int32_t)(x)>>31))
-#define non_negative_to_signed(x)   ((((x)&1)?~(x):(x))>>1)
+#define signed_to_non_negative(x)   (((uint32_t)(x)<<1)^((int32_t)(x)>>31))
+#define non_negative_to_signed(x)   ((int32_t)(((x)&1)?~(x):(x))>>1)
 
 #define MAX_DECORR 6
 
@@ -485,7 +485,7 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift)
 {
     while (sample_count--) {
-        *audio_samples <<= shift;
+        * (uint32_t *) audio_samples <<= shift;
         audio_samples += stride;
     }
 }
@@ -547,7 +547,7 @@ static void correlate_factor (int32_t *audio_samples, int sample_count, int stri
 static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
 {
     int bits = sample_count * 31;
-    int32_t temp = 0;
+    uint32_t temp = 0;
 
     while (sample_count--) {
         temp += *audio_samples -= temp;
@@ -561,7 +561,7 @@ static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
 static int correlate (int32_t *audio_samples, int sample_count, int stride)
 {
     int bits = sample_count * 31;
-    int32_t value = 0;
+    uint32_t value = 0;
 
     while (sample_count--) {
         value = *audio_samples += value;
