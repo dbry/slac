@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////
 //                           ****** SLAC ******                           //
 //                    Simple Lossless Audio Compressor                    //
-//                 Copyright (c) 2019 - 2021 David Bryant                 //
+//                 Copyright (c) 2019 - 2022 David Bryant                 //
 //                          All Rights Reserved.                          //
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
@@ -25,19 +25,65 @@
 #include "bitstream.h"
 #include "libslac.h"
 
-// Unfortunately a variable with about 40 bits bits of magnitude is required
-// to calculate the optimum Rice code size. This is typedef'd here to be either
-// a float or a 64-bit integer (int64_t), so use whatever is best for your
-// platform.
+// If your platform has hardware support for counting leading zeros in 32-bit
+// integers, define it here (these are for gcc and friends).
 
-typedef int64_t slac_mag_t;
+#if INT_MAX == 32767
+#define count_leading_zeros __builtin_clzl
+#else
+#define count_leading_zeros __builtin_clz
+#endif
+
+#ifdef NO_BUILTIN_CLZ
+
+// If your platform does not support __builtin_clz() or a variant, define this macro
+// to instantiate a native C implementation. It is a hybrid of the Hacker's Delight
+// binary search method and a table-driven technique.
+
+static inline int count_leading_zeros (uint32_t x)
+{
+    static const char nbits_table [] = {
+        0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,     // 0 - 15
+        5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,     // 16 - 31
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,     // 32 - 47
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,     // 48 - 63
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     // 64 - 79
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     // 80 - 95
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     // 96 - 111
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     // 112 - 127
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 128 - 143
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 144 - 159
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 160 - 175
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 176 - 191
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 192 - 207
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 208 - 223
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // 224 - 239
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8      // 240 - 255
+    };
+
+    uint32_t y;
+    int n = 32;
+
+    if ((y = x >> 16)) {
+        n -= 16;
+        x = y;
+    }
+
+    if ((y = x >> 8)) {
+        n -= 8;
+        x = y;
+    }
+
+    return n - nbits_table [x];
+}
+#endif
 
 // These complementary macros convert from signed integers into the non-negative
 // values that slac uses for analysis and entropy encoding (with the sign moved
 // to the LSB), and back.
 
 #define signed_to_non_negative(x)   (((uint32_t)(x)<<1)^((int32_t)(x)>>31))
-#define non_negative_to_signed(x)   ((int32_t)(((x)&1)?~(x):(x))>>1)
+#define non_negative_to_signed(x)   ((int32_t)(-(int32_t)((x)&1)^(x))>>1)
 
 #define MAX_DECORR 6
 
@@ -46,7 +92,7 @@ typedef int64_t slac_mag_t;
 static int decorrelate (int32_t *audio_samples, int sample_count, int stride);
 static int correlate (int32_t *audio_samples, int sample_count, int stride);
 
-static int decorrs [8], rice_ks [32], shifts [32];    // used for statistics only
+static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics only
 
 /******************************* COMPRESSION *********************************/
 
@@ -146,7 +192,7 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
     putbits (rice_k + 1, 5, bs);    // the Rice k parameter (offset 1) is stored in the first 5 bits
 
     if (rice_k > 0) {
-        uint32_t mask = (1 << rice_k) - 1;
+        uint32_t mask = (1UL << rice_k) - 1;
 
         while (sample_count--) {
             uint32_t avalue = signed_to_non_negative (*audio_samples);
@@ -174,36 +220,42 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
 }
 
 // Calculate the optimum Rice k parameter (i.e. number of bits sent literally
-// for each sample) for the supplied sample data. This requires a variable type
-// with about 40 bits of magnitude (not resolution) because we calculate the
-// sum of all the samples. This can be either a 32-bit float or a 64-bit
-// integer, whichever is better for the platform (see typedef above). This
-// is only done a few times per block, so it should not make a huge time
-// contribution. If there are only zero samples this function returns -1 so
-// that silent blocks can be efficiently handled.
+// for each sample) for the supplied sample data. We calculate the sum of all
+// the (converted to non-negative) sample values which requires more than just
+// 32 bits of magnitude. To avoid requiring a 64-bit integer type (which some
+// platforms don't have) or a float (which can be slow on some platforms) this
+// is done with a 32-bit unsigned integer and another integer for overflows.
+// Just the final calculation is done in floats. If there are only zero samples
+// this function returns -1 so that silent blocks can be efficiently handled.
 
 static int best_rice_k (int32_t *audio_samples, int sample_count, int stride)
 {
-    slac_mag_t avalue_sum = 0, min_bits;
-    int count = sample_count, rice_k = 0;
+    int count = sample_count, upper32 = 0, rice_k = 0;
+    float float_sum = 0, min_bits;
     int32_t *dptr = audio_samples;
+    uint32_t lower32 = 0;
 
     while (count--) {
-        avalue_sum += signed_to_non_negative (*dptr);
+        uint32_t temp = lower32;
+
+        if ((lower32 += signed_to_non_negative (*dptr)) < temp)
+            upper32++;
+
         dptr += stride;
     }
 
-    if (!avalue_sum)        // return -1 for complete silence
+    if (!upper32 && !lower32)        // return -1 for complete silence
         return -1;
 
-    min_bits = avalue_sum + sample_count;
+    float_sum = upper32 * 4294967296.0 + lower32;
+    min_bits = float_sum + sample_count;
 
     // min_bits this is now the exact total number of bits used for encoding the
     // samples with k=0; next we'll increase k and estimate the resulting bit
     // count as long as it continues to improve
 
     while (1) {
-        slac_mag_t bits = (avalue_sum /= 2) + (++rice_k * sample_count) + sample_count - (sample_count / 6);
+        float bits = (float_sum /= 2) + (++rice_k * sample_count) + sample_count - (sample_count / 6);
 
         if (bits < min_bits)
             min_bits = bits;
@@ -220,7 +272,7 @@ static int best_rice_k (int32_t *audio_samples, int sample_count, int stride)
 
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
 {
-    int count = sample_count, redundant_bits;
+    int count = sample_count, redundant_bits = 0;
     int32_t *dptr = audio_samples;
     int32_t ordata = 0;
 
@@ -230,7 +282,11 @@ static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
         else
             dptr += stride;
 
-    redundant_bits = ordata ? __builtin_ctz (ordata) : 0;
+    if (ordata)
+        while (!(ordata & 1)) {
+            redundant_bits++;
+            ordata >>= 1;
+        }
 
     if (redundant_bits)
         while (sample_count--) {
@@ -254,7 +310,7 @@ static int magnitude_bits (int32_t *audio_samples, int sample_count, int stride)
     int bits = sample_count * 31;
 
     for (dptr = audio_samples; dptr < eptr; dptr += stride)
-        bits -= __builtin_clz (signed_to_non_negative (*dptr) + 1);
+        bits -= count_leading_zeros (signed_to_non_negative (*dptr) + 1);
 
     return bits;
 }
@@ -341,16 +397,17 @@ void dump_compression_stats (FILE *file)
     int maxnz = -1, i;
     char string [256];
 
-    fprintf (file, "decorr: (%d) %d %d %d %d %d %d %d\n",
-        decorrs[0],decorrs[1],decorrs[2],decorrs[3],decorrs[4],decorrs[5],decorrs[6],decorrs[7]);
+    fprintf (file, "decorr: (%ld) %ld %ld %ld %ld %ld %ld %ld\n",
+        (long) decorrs[0], (long) decorrs[1], (long) decorrs[2], (long) decorrs[3],
+        (long) decorrs[4], (long) decorrs[5], (long) decorrs[6], (long) decorrs[7]);
 
     for (i = 0; i < 32; ++i) if (rice_ks [i]) maxnz = i;
-    for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), i ? " %d" : " (%d)", rice_ks [i]);
+    for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), i ? " %ld" : " (%ld)", (long) rice_ks [i]);
     fprintf (file, "rice-k:%s (max = %d)\n", string, maxnz - 1);
 
     for (i = 0; i < 32; ++i) if (shifts [i]) maxnz = i;
     if (maxnz) {
-        for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), " %d", shifts [i]);
+        for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), " %ld", (long) shifts [i]);
         fprintf (file, "shifts:%s (max = %d)\n", string, maxnz);
     }
 
@@ -362,7 +419,6 @@ void dump_compression_stats (FILE *file)
 /****************************** DECOMPRESSION ********************************/
 
 static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
-static void correlate_factor (int32_t *audio_samples, int sample_count, int stride, int factor);
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift);
 static void ms_to_lr (int32_t *audio_samples, int sample_count);
 static void dm_to_lr (int32_t *audio_samples, int sample_count);
@@ -411,10 +467,8 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 
         if (decorr < 0)
             decorrelate (audio_samples + chan, sample_count, num_chans);
-        else if (decorr == 1)
+        else while (decorr--)
             correlate (audio_samples + chan, sample_count, num_chans);
-        else if (decorr > 1)
-            correlate_factor (audio_samples + chan, sample_count, num_chans, decorr);
 
         if (shift)
             leftshift_bits (audio_samples + chan, sample_count, num_chans, shift);
@@ -452,7 +506,7 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
             audio_samples += stride;
         }
     else if (rice_k > 0) {      // normal case for k > 0
-        uint32_t mask = (1 << rice_k) - 1, rice_k_bits;
+        uint32_t mask = (1UL << rice_k) - 1, rice_k_bits;
 
         while (sample_count--) {
             uint32_t avalue = 0;
@@ -512,24 +566,6 @@ static void ms_to_lr (int32_t *audio_samples, int sample_count)
     }
 }
 
-// This function is identical to the regular correlate() function except for
-// two things. First, it can concatenate several correlate operations into one
-// without making multiple passes through the audio, so it is faster for
-// decoding when we know how many operations are required. Also, since it's
-// for decoding, we don't calculate and return the magnitude bits.
-
-static void correlate_factor (int32_t *audio_samples, int sample_count, int stride, int factor)
-{
-    const int32_t *fptr = audio_samples + (sample_count + factor - 1) * stride;
-    const int32_t *eptr = audio_samples + sample_count * stride;
-    int32_t *dptr, *aptr, i;
-
-    for (dptr = audio_samples + stride; dptr < fptr; dptr += stride)
-        for (aptr = dptr, i = factor; i--; aptr -= stride)
-            if (aptr > audio_samples && aptr < eptr)
-                *aptr += aptr [-stride];
-}
-
 /********************* COMMON CORRELATION / DECORRELATION ********************/
 
 // These two complementary functions are at the heart of the compressor and
@@ -551,7 +587,7 @@ static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
 
     while (sample_count--) {
         temp += *audio_samples -= temp;
-        bits -= __builtin_clz (signed_to_non_negative (*audio_samples) + 1);
+        bits -= count_leading_zeros (signed_to_non_negative (*audio_samples) + 1);
         audio_samples += stride;
     }
 
@@ -565,7 +601,7 @@ static int correlate (int32_t *audio_samples, int sample_count, int stride)
 
     while (sample_count--) {
         value = *audio_samples += value;
-        bits -= __builtin_clz (signed_to_non_negative (value) + 1);
+        bits -= count_leading_zeros (signed_to_non_negative (value) + 1);
         audio_samples += stride;
     }
 

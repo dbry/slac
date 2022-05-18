@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////
 //                           ****** SLAC ******                           //
 //                    Simple Lossless Audio Compressor                    //
-//                    Copyright (c) 2019 David Bryant.                    //
+//                 Copyright (c) 2019 - 2022 David Bryant                 //
 //                          All Rights Reserved.                          //
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
@@ -28,8 +28,8 @@
 #include "libslac.h"
 
 static const char *sign_on = "\n"
-" SLAC  Simple Lossless Audio Compressor Demo  Version 0.2\n"
-" Copyright (c) 2019 David Bryant. All Rights Reserved.\n\n";
+" SLAC  Simple Lossless Audio Compressor Demo  Version 0.3\n"
+" Copyright (c) 2022 David Bryant. All Rights Reserved.\n\n";
 
 static const char *usage =
 " Usage:     SLAC [-options] infile.wav outfile.slac\n"
@@ -204,12 +204,12 @@ typedef struct {
 #define WAVE_FORMAT_PCM         0x1
 #define WAVE_FORMAT_EXTENSIBLE  0xfffe
 
-static int encode_slac (FILE *infile, FILE *outfile, size_t total_samples, int num_chans, int sample_rate, int bytes_per_sample);
+static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int num_chans, int sample_rate_index, int bytes_per_sample);
 
 static int encode_wav_to_slac (char *infilename, char *outfilename)
 {
-    int format = 0, res = 0, bits_per_sample = 0, sample_rate = 0, num_channels = 0;
-    size_t num_samples = 0;
+    int format = 0, res = 0, bits_per_sample = 0, num_channels = 0;
+    uint32_t num_samples = 0, sample_rate = 0;
     FILE *infile, *outfile;
     RiffChunkHeader riff_chunk_header;
     ChunkHeader chunk_header;
@@ -298,19 +298,20 @@ static int encode_wav_to_slac (char *infilename, char *outfilename)
             }
 
             if (verbose_mode) {
-                fprintf (stderr, "format tag size = %d\n", chunk_header.ckSize);
+                fprintf (stderr, "format tag size = %lu\n", (unsigned long) chunk_header.ckSize);
                 fprintf (stderr, "FormatTag = 0x%x, NumChannels = %d, BitsPerSample = %d\n",
                     WaveHeader.FormatTag, WaveHeader.NumChannels, WaveHeader.BitsPerSample);
-                fprintf (stderr, "BlockAlign = %d, SampleRate = %d, BytesPerSecond = %d\n",
-                    WaveHeader.BlockAlign, WaveHeader.SampleRate, WaveHeader.BytesPerSecond);
+                fprintf (stderr, "BlockAlign = %d, SampleRate = %lu, BytesPerSecond = %lu\n",
+                    WaveHeader.BlockAlign, (unsigned long) WaveHeader.SampleRate,
+                    (unsigned long) WaveHeader.BytesPerSecond);
 
                 if (chunk_header.ckSize > 16)
                         fprintf (stderr, "cbSize = %d, ValidBitsPerSample = %d\n", WaveHeader.cbSize,
                             WaveHeader.Samples.ValidBitsPerSample);
 
                 if (chunk_header.ckSize > 20)
-                    fprintf (stderr, "ChannelMask = %x, SubFormat = %d\n",
-                        WaveHeader.ChannelMask, WaveHeader.SubFormat);
+                    fprintf (stderr, "ChannelMask = %lx, SubFormat = %d\n",
+                        (unsigned long) WaveHeader.ChannelMask, WaveHeader.SubFormat);
             }
         }
         else if (!strncmp (chunk_header.ckID, "data", 4)) {
@@ -351,9 +352,9 @@ static int encode_wav_to_slac (char *infilename, char *outfilename)
             char dummy;
 
             if (verbose_mode)
-                fprintf (stderr, "extra unknown chunk \"%c%c%c%c\" of %d bytes\n",
+                fprintf (stderr, "extra unknown chunk \"%c%c%c%c\" of %lu bytes\n",
                     chunk_header.ckID [0], chunk_header.ckID [1], chunk_header.ckID [2],
-                    chunk_header.ckID [3], chunk_header.ckSize);
+                    chunk_header.ckID [3], (unsigned long) chunk_header.ckSize);
 
             while (bytes_to_eat--)
                 if (!fread (&dummy, 1, 1, infile)) {
@@ -374,18 +375,18 @@ static int encode_wav_to_slac (char *infilename, char *outfilename)
         return -1;
     }
 
-    res = encode_slac (infile, outfile, num_samples, num_channels, sample_rate, bits_per_sample / 8);
+    res = encode_slac (infile, outfile, num_samples, num_channels, (int) sample_rate, bits_per_sample / 8);
 
     fclose (outfile);
     fclose (infile);
     return res;
 }
 
-static int encode_slac (FILE *infile, FILE *outfile, size_t total_samples, int num_chans, int sample_rate, int bytes_per_sample)
+static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int num_chans, int sample_rate, int bytes_per_sample)
 {
     unsigned char raw_audio_block [block_samples * num_chans * bytes_per_sample];
     char encoded_block [256 + block_samples * 4 * num_chans];
-    size_t samples_left = total_samples, total_bytes = 0;
+    uint32_t samples_left = total_samples, total_bytes = 0;
     int32_t audio_block [block_samples * num_chans];
     int block_count = 0, stereo [4] = { 0 };
 
@@ -477,10 +478,10 @@ static int encode_slac (FILE *infile, FILE *outfile, size_t total_samples, int n
     }
 
     if (!quiet_mode) {
-        size_t source_bytes = (total_samples - samples_left) * num_chans * bytes_per_sample;
+        uint32_t source_bytes = (total_samples - samples_left) * num_chans * bytes_per_sample;
 
-        fprintf (stderr, "compressed %d blocks, each containing %d %d-bit %s samples, into %zu bytes\n",
-            block_count, block_samples, bytes_per_sample * 8, num_chans == 2 ? "stereo" : "mono", total_bytes);
+        fprintf (stderr, "compressed %d blocks, of %d %d-bit %s samples each, into %lu bytes\n",
+            block_count, block_samples, bytes_per_sample * 8, num_chans == 2 ? "stereo" : "mono", (unsigned long) total_bytes);
         fprintf (stderr, "overall compression ratio was %.2f%%, or %.2f bits per sample\n",
             total_bytes * 100.0 / source_bytes, total_bytes * 8.0 / num_chans / (total_samples - samples_left));
     }
@@ -497,12 +498,12 @@ static int encode_slac (FILE *infile, FILE *outfile, size_t total_samples, int n
 
 /***************************** DECODE SLAC TO WAV *****************************/
 
-static int write_pcm_wav_header (FILE *outfile, size_t num_samples, int num_channels, int bytes_per_sample, int sample_rate);
+static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate);
 
 static int decode_slac_to_wav (char *infilename, char *outfilename)
 {
-    int block_byte_count, sample_count, sample_rate = 0, bytes_per_sample = 0, num_chans = 0, res = 0;
-    size_t total_samples = 0;
+    int block_byte_count, sample_count, bytes_per_sample = 0, num_chans = 0, res = 0;
+    uint32_t total_samples = 0, sample_rate = 0;
     FILE *infile, *outfile;
 
     if (*infilename == '-') {
@@ -631,14 +632,14 @@ static int decode_slac_to_wav (char *infilename, char *outfilename)
     return res;
 }
 
-static int write_pcm_wav_header (FILE *outfile, size_t num_samples, int num_channels, int bytes_per_sample, int sample_rate)
+static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate)
 {
     RiffChunkHeader riffhdr;
     ChunkHeader datahdr, fmthdr;
     WaveHeader wavhdr;
 
     int wavhdrsize = 16;
-    size_t total_data_bytes = num_samples * bytes_per_sample * num_channels;
+    uint32_t total_data_bytes = num_samples * bytes_per_sample * num_channels;
 
     memset (&wavhdr, 0, sizeof (wavhdr));
 
@@ -649,13 +650,13 @@ static int write_pcm_wav_header (FILE *outfile, size_t num_samples, int num_chan
     wavhdr.BlockAlign = bytes_per_sample * num_channels;
     wavhdr.BitsPerSample = bytes_per_sample * 8;
 
-    strncpy (riffhdr.ckID, "RIFF", sizeof (riffhdr.ckID));
-    strncpy (riffhdr.formType, "WAVE", sizeof (riffhdr.formType));
+    memcpy (riffhdr.ckID, "RIFF", sizeof (riffhdr.ckID));
+    memcpy (riffhdr.formType, "WAVE", sizeof (riffhdr.formType));
     riffhdr.ckSize = sizeof (riffhdr) + wavhdrsize + sizeof (datahdr) + total_data_bytes;
-    strncpy (fmthdr.ckID, "fmt ", sizeof (fmthdr.ckID));
+    memcpy (fmthdr.ckID, "fmt ", sizeof (fmthdr.ckID));
     fmthdr.ckSize = wavhdrsize;
 
-    strncpy (datahdr.ckID, "data", sizeof (datahdr.ckID));
+    memcpy (datahdr.ckID, "data", sizeof (datahdr.ckID));
     datahdr.ckSize = total_data_bytes;
 
     // write the RIFF chunks up to just before the data starts
