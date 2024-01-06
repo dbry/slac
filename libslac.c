@@ -25,20 +25,21 @@
 #include "bitstream.h"
 #include "libslac.h"
 
-// If your platform has hardware support for counting leading zeros in 32-bit
-// integers, define it here (these are for gcc and friends).
+// If your platform has hardware support for counting leading and trailing
+// zeros in 32-bit integers, define it here (these are for gcc and friends).
 
 #if INT_MAX == 32767
+#define count_trailing_zeros __builtin_ctzl
 #define count_leading_zeros __builtin_clzl
 #else
+#define count_trailing_zeros __builtin_ctz
 #define count_leading_zeros __builtin_clz
 #endif
 
-#ifdef NO_BUILTIN_CLZ
+#ifdef NO_BUILTINS
 
-// If your platform does not support __builtin_clz() or a variant, define this macro
-// to instantiate a native C implementation. It is a hybrid of the Hacker's Delight
-// binary search method and a table-driven technique.
+// If your platform does not support __builtin_clz()/ctz() or their variants, define
+// this macro to instantiate native C implementations found in various places.
 
 static inline int count_leading_zeros (uint32_t x)
 {
@@ -76,6 +77,17 @@ static inline int count_leading_zeros (uint32_t x)
 
     return n - nbits_table [x];
 }
+
+static inline int count_trailing_zeros (uint32_t x)
+{
+    static const char debruijn_table [] = {
+         0,  1, 28,  2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17,  4, 8,
+        31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18,  6, 11,  5, 10, 9
+    };
+
+    return debruijn_table [(uint32_t)((x & -x) * 0x077CB531U) >> 27];
+}
+
 #endif
 
 // These complementary macros convert from signed integers into the non-negative
@@ -92,7 +104,19 @@ static inline int count_leading_zeros (uint32_t x)
 static int decorrelate (int32_t *audio_samples, int sample_count, int stride);
 static int correlate (int32_t *audio_samples, int sample_count, int stride);
 
+// Identical versions that just do not return the magnitude
+
+static void void_decorrelate (int32_t *audio_samples, int sample_count, int stride);
+static void void_correlate (int32_t *audio_samples, int sample_count, int stride);
+
 static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics only
+
+// #define MODULO_STATS
+
+#ifdef MODULO_STATS
+static uint64_t total_modulo, num_modulo;
+static uint32_t max_modulos [32];
+#endif
 
 /******************************* COMPRESSION *********************************/
 
@@ -155,10 +179,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
         decorrs [decorr + 1]++;
 
         // since the shift amount is generally small, store that in unary (1's followed by 0)
-        while (shift--)
-            putbit_1 (&bs);
-
-        putbit_0 (&bs);
+        putcount (shift, &bs);
 
         // because the magnitude of the first few samples can be very different than the rest
         // of the data (because they're not as decorrelated), we store those using their own
@@ -186,7 +207,9 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
 {
     int rice_k = best_rice_k (audio_samples, sample_count, stride);
 
+#ifndef MODULO_STATS
     if (sample_count > MAX_DECORR)  // only count the "real" blocks in the statistics
+#endif
         rice_ks [rice_k + 1]++;
 
     putbits (rice_k + 1, 5, bs);    // the Rice k parameter (offset 1) is stored in the first 5 bits
@@ -198,10 +221,15 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
             uint32_t avalue = signed_to_non_negative (*audio_samples);
             int modulo = avalue >> rice_k;
 
-            while (modulo--)
-                putbit_1 (bs);
+#ifdef MODULO_STATS
+            if (modulo > max_modulos [rice_k])
+                max_modulos [rice_k] = modulo;
 
-            putbit_0 (bs);
+            total_modulo += modulo;
+            num_modulo++;
+#endif
+
+            putcount (modulo, bs);
             avalue &= mask;
             putbits (avalue, rice_k, bs);
             audio_samples += stride;
@@ -211,10 +239,15 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
         while (sample_count--) {
             uint32_t avalue = signed_to_non_negative (*audio_samples);
 
-            while (avalue--)
-                putbit_1 (bs);
+#ifdef MODULO_STATS
+            if (avalue > max_modulos [0])
+                max_modulos [0] = avalue;
 
-            putbit_0 (bs);
+            total_modulo += avalue;
+            num_modulo++;
+#endif
+
+            putcount (avalue, bs);
             audio_samples += stride;
         }
 }
@@ -337,7 +370,7 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
             best_magnitude = magnitude;
         }
         else {
-            correlate (audio_samples, sample_count, stride); decorr_index--;
+            void_correlate (audio_samples, sample_count, stride); decorr_index--;
             break;
         }
     }
@@ -352,7 +385,7 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
             best_magnitude = magnitude;
         }
         else {
-            decorrelate (audio_samples, sample_count, stride); decorr_index++;
+            void_decorrelate (audio_samples, sample_count, stride); decorr_index++;
         }
     }
 
@@ -405,6 +438,11 @@ void dump_compression_stats (FILE *file)
     for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), i ? " %ld" : " (%ld)", (long) rice_ks [i]);
     fprintf (file, "rice-k:%s (max = %d)\n", string, maxnz - 1);
 
+#ifdef MODULO_STATS
+    for (string [0] = i = 0; i < maxnz; ++i) sprintf (string + strlen(string), " %ld", (long) max_modulos [i]);
+    fprintf (file, "max modulo:%s, average = %g\n", string, (double) total_modulo / num_modulo);
+#endif
+
     for (i = 0; i < 32; ++i) if (shifts [i]) maxnz = i;
     if (maxnz) {
         for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), " %ld", (long) shifts [i]);
@@ -445,14 +483,12 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
 
-    for (chan = 0; chan < read_chans && !bs.error; ++chan) {
-        int shift = 0, decorr;
+    for (chan = 0; chan < read_chans && !bs.wrapc; ++chan) {
+        int shift, decorr;
 
         getbits (&decorr, 3, &bs);      // the first 3 bits for each channel is the decorrelation info
         decorr = (decorr & 0x7) - 1;
-
-        while (getbit (&bs))            // the number of 1's that follow is the final left-shift amount
-            shift++;
+        getcount (&shift, &bs);         // the number of 1's that follow is the final left-shift amount
 
         // as with encoding, we read the first few still correlated samples in a separate Rice operation
 
@@ -466,9 +502,9 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
         // next undo the decorrelation step, and finally the shift
 
         if (decorr < 0)
-            decorrelate (audio_samples + chan, sample_count, num_chans);
+            void_decorrelate (audio_samples + chan, sample_count, num_chans);
         else while (decorr--)
-            correlate (audio_samples + chan, sample_count, num_chans);
+            void_correlate (audio_samples + chan, sample_count, num_chans);
 
         if (shift)
             leftshift_bits (audio_samples + chan, sample_count, num_chans, shift);
@@ -481,8 +517,8 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     else if (stereo_mode == DUAL_MONO)
         dm_to_lr (audio_samples, sample_count);
 
-    res = bs.error;         // if we went past the end of the buffer, flag an error
-    bs_close_read (&bs);
+    if (bs_close_read (&bs) == -1)
+        res = 1;
 
     return res;
 }
@@ -506,14 +542,10 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
             audio_samples += stride;
         }
     else if (rice_k > 0) {      // normal case for k > 0
-        uint32_t mask = (1UL << rice_k) - 1, rice_k_bits;
+        uint32_t mask = (1UL << rice_k) - 1, avalue, rice_k_bits;
 
         while (sample_count--) {
-            uint32_t avalue = 0;
-
-            while (getbit (bs))
-                avalue++;
-
+            getcount (&avalue, bs);
             avalue <<= rice_k;
             getbits (&rice_k_bits, rice_k, bs);
             avalue |= (rice_k_bits & mask);
@@ -521,16 +553,15 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
             audio_samples += stride;
         }
     }
-    else                        // optimized case for k == 0
+    else {                      // optimized case for k == 0
+        uint32_t avalue;
+
         while (sample_count--) {
-            uint32_t avalue = 0;
-
-            while (getbit (bs))
-                avalue++;
-
+            getcount (&avalue, bs);
             *audio_samples = non_negative_to_signed (avalue);
             audio_samples += stride;
         }
+    }
 }
 
 // Leftshift specified number of zeros into the audio samples. This is to undo
@@ -606,4 +637,28 @@ static int correlate (int32_t *audio_samples, int sample_count, int stride)
     }
 
     return bits;
+}
+
+// Identical versions that just do not return the magnitude. These should not be
+// required with global optimizing compilers discarding the magnitude calculations,
+// but it just seems like a better idea to have separate version.
+
+static void void_decorrelate (int32_t *audio_samples, int sample_count, int stride)
+{
+    uint32_t temp = 0;
+
+    while (sample_count--) {
+        temp += *audio_samples -= temp;
+        audio_samples += stride;
+    }
+}
+
+static void void_correlate (int32_t *audio_samples, int sample_count, int stride)
+{
+    uint32_t value = 0;
+
+    while (sample_count--) {
+        value = *audio_samples += value;
+        audio_samples += stride;
+    }
 }

@@ -59,7 +59,7 @@ static void native_to_little_endian (void *data, char *format);
 static int block_samples = 1024, joint_stereo = 1;
 static int verbose_mode, quiet_mode, raw_decode;
 
-int main (argc, argv) int argc; char **argv;
+int main (int argc, char **argv)
 {
     int decode_mode = 0, asked_help = 0, overwrite = 0;
     char *infilename = NULL, *outfilename = NULL;
