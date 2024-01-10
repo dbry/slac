@@ -104,10 +104,10 @@ static inline int count_trailing_zeros (uint32_t x)
 static int decorrelate (int32_t *audio_samples, int sample_count, int stride);
 static int correlate (int32_t *audio_samples, int sample_count, int stride);
 
-// Identical versions that just do not return the magnitude
+// Essentially identical versions that just do not return the magnitude
 
 static void void_decorrelate (int32_t *audio_samples, int sample_count, int stride);
-static void void_correlate (int32_t *audio_samples, int sample_count, int stride);
+static void void_correlate (int32_t *audio_samples, int sample_count, int depth, int stride);
 
 static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics only
 
@@ -370,7 +370,7 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
             best_magnitude = magnitude;
         }
         else {
-            void_correlate (audio_samples, sample_count, stride); decorr_index--;
+            void_correlate (audio_samples, sample_count, 1, stride); decorr_index--;
             break;
         }
     }
@@ -503,8 +503,8 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 
         if (decorr < 0)
             void_decorrelate (audio_samples + chan, sample_count, num_chans);
-        else while (decorr--)
-            void_correlate (audio_samples + chan, sample_count, num_chans);
+        else if (decorr)
+            void_correlate (audio_samples + chan, sample_count, decorr, num_chans);
 
         if (shift)
             leftshift_bits (audio_samples + chan, sample_count, num_chans, shift);
@@ -639,9 +639,11 @@ static int correlate (int32_t *audio_samples, int sample_count, int stride)
     return bits;
 }
 
-// Identical versions that just do not return the magnitude. These should not be
-// required with global optimizing compilers discarding the magnitude calculations,
-// but it just seems like a better idea to have separate version.
+// Essentially identical versions that just do not return the magnitude. These should
+// not be required with global optimizing compilers discarding the magnitude
+// calculations, but it just seems like a better idea to have separate versions.
+// Also, this correlation version performs the equivalent of multiple passes (which
+// is generally required for decoding).
 
 static void void_decorrelate (int32_t *audio_samples, int sample_count, int stride)
 {
@@ -653,12 +655,57 @@ static void void_decorrelate (int32_t *audio_samples, int sample_count, int stri
     }
 }
 
-static void void_correlate (int32_t *audio_samples, int sample_count, int stride)
+static void void_correlate (int32_t *audio_samples, int sample_count, int depth, int stride)
 {
-    uint32_t value = 0;
+    uint32_t value [6] = { 0 };
 
-    while (sample_count--) {
-        value = *audio_samples += value;
-        audio_samples += stride;
+    switch (depth) {
+        case 1:
+            while (sample_count--) {
+                value [0] = *audio_samples += value [0];
+                audio_samples += stride;
+            }
+
+            break;
+
+        case 2:
+            while (sample_count--) {
+                *audio_samples = value [1] += value [0] += *audio_samples;
+                audio_samples += stride;
+            }
+
+            break;
+
+        case 3:
+            while (sample_count--) {
+                *audio_samples = value [2] += value [1] += value [0] += *audio_samples;
+                audio_samples += stride;
+            }
+
+            break;
+
+        case 4:
+            while (sample_count--) {
+                *audio_samples = value [3] += value [2] += value [1] += value [0] += *audio_samples;
+                audio_samples += stride;
+            }
+
+            break;
+
+        case 5:
+            while (sample_count--) {
+                *audio_samples = value [4] += value [3] += value [2] += value [1] += value [0] += *audio_samples;
+                audio_samples += stride;
+            }
+
+            break;
+
+        case 6:
+            while (sample_count--) {
+                *audio_samples = value [5] += value [4] += value [3] += value [2] += value [1] += value [0] += *audio_samples;
+                audio_samples += stride;
+            }
+
+            break;
     }
 }

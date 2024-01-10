@@ -28,8 +28,8 @@
 #include "libslac.h"
 
 static const char *sign_on = "\n"
-" SLAC  Simple Lossless Audio Compressor Demo  Version 0.3\n"
-" Copyright (c) 2022 David Bryant. All Rights Reserved.\n\n";
+" SLAC  Simple Lossless Audio Compressor Demo  Version 0.4\n"
+" Copyright (c) 2024 David Bryant. All Rights Reserved.\n\n";
 
 static const char *usage =
 " Usage:     SLAC [-options] infile.wav outfile.slac\n"
