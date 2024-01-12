@@ -483,7 +483,7 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
 
-    for (chan = 0; chan < read_chans && !bs.wrapc; ++chan) {
+    for (chan = 0; chan < read_chans; ++chan) {
         int shift, decorr;
 
         getbits (&decorr, 3, &bs);      // the first 3 bits for each channel is the decorrelation info

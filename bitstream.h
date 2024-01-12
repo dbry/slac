@@ -28,7 +28,7 @@ typedef struct bs {
     while (1) {                                                 \
         while ((bs)->bc < 25) {                                 \
             if (++((bs)->ptr) == (bs)->end) (bs)->wrap (bs);    \
-            (bs)->sr |= (int32_t)*((bs)->ptr) << (bs)->bc;      \
+            (bs)->sr |= (uint32_t)*((bs)->ptr) << (bs)->bc;     \
             (bs)->bc += 8;                                      \
         }                                                       \
         if (((bs)->sr & 0x1FFFFFF) == 0x1FFFFFF) {              \
@@ -53,7 +53,7 @@ typedef struct bs {
 #define getbits(value, nbits, bs) do {                          \
     while ((nbits) > (bs)->bc) {                                \
         if (++((bs)->ptr) == (bs)->end) (bs)->wrap (bs);        \
-        (bs)->sr |= (int32_t)*((bs)->ptr) << (bs)->bc;          \
+        (bs)->sr |= (uint32_t)*((bs)->ptr) << (bs)->bc;         \
         (bs)->bc += 8;                                          \
     }                                                           \
     *(value) = (bs)->sr;                                        \
@@ -100,7 +100,7 @@ typedef struct bs {
 // mask is required beforehand if this is possible.
 
 #define putbits(value, nbits, bs) do {                          \
-    (bs)->sr |= (int32_t)(value) << (bs)->bc;                   \
+    (bs)->sr |= (uint32_t)(value) << (bs)->bc;                  \
     if (((bs)->bc += (nbits)) >= 8)                             \
         do {                                                    \
             *((bs)->ptr) = (bs)->sr;                            \
