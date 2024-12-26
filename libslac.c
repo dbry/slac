@@ -17,6 +17,42 @@
 // No allocation is used; everything is done in place using the passed input
 // and output buffers.
 
+//                          Notes on this Version
+//                          ---------------------
+
+// This is an experimental version of SLAC to test the concept of half-Rice
+// codes. Essentially, this is a variation on standard Rice coding where we
+// have an intermediate code between each regular Rice code, with each higher
+// half-code getting 1.414 times the number of codes as the preceding code.
+// Obviously if the number of codes is not a power of two (which these would
+// not be) then all the codes are not sent with the same number of bits.
+//
+// For this experimental version we simply try the previous and the next
+// half-codes based on the regular k prediction. These half codes are not as
+// efficient as the full codes, but if the true optimum k value is close to
+// midway between two integer values, then these codes can help. The overall
+// improvement is minimal (up to 0.3% with 8-bit data), but non-zero. The
+// speed hit is not great, and so this would probably be worthwhile if an
+// algorithm to find the optimum half-k value could be employed rather
+// than brute-force trying the adjacent values.
+//
+// One quirky thing is the k = 0.5 case. At first I though this would not
+// work, but then came up with a weird code that adds 2 bits every 3
+// codes that is suprisingly easy to implement and halfway between Rice
+// k = 0 and k = 1:
+//
+// 0 = 0-0
+// 1 = 0-1
+// 2 = 1-0
+// 3 = 1-1-0-0
+// 4 = 1-1-0-1
+// 5 = 1-1-1-0
+// 6 = 1-1-1-1-0-0
+// 7 = 1-1-1-1-0-1
+// 8 = 1-1-1-1-1-0
+// 9 = 1-1-1-1-1-1-0-0
+// ...
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -92,7 +128,7 @@ static inline int count_leading_zeros (uint32_t x)
 static int decorrelate (int32_t *audio_samples, int sample_count, int stride);
 static int correlate (int32_t *audio_samples, int sample_count, int stride);
 
-static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics only
+static int32_t decorrs [8], rice_ks [64], shifts [32], rice_off [3];  // used for statistics only
 
 /******************************* COMPRESSION *********************************/
 
@@ -162,7 +198,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
 
         // because the magnitude of the first few samples can be very different than the rest
         // of the data (because they're not as decorrelated), we store those using their own
-        // Rice parameter; this only costs 5 bits per channel, but can make a huge improvement
+        // Rice parameter; this only costs 6 bits per channel, but can make a huge improvement
 
         if (decorr && abs (decorr) < sample_count) {
             entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans);
@@ -180,34 +216,57 @@ static int best_rice_k (int32_t *audio_samples, int sample_count, int stride);
 // Encode the supplied array of samples into a bitstream using Rice encoding.
 // If stereo data is being compressed the channels must be processed in two
 // separate passes and the stride parameter should be 2 and the pointer set to
-// the first sample of the desired channel.
+// the first sample of the desired channel. Returns the number of stream bit
+// used so far which can be used to compare the results with different Rice
+// values.
 
-static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+static int entropy_encode_halfrice (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int half_rice_k)
 {
-    int rice_k = best_rice_k (audio_samples, sample_count, stride);
+    putbits (half_rice_k + 1, 6, bs);    // the Rice k parameter (offset 1) is stored in the first 6 bits
 
-    if (sample_count > MAX_DECORR)  // only count the "real" blocks in the statistics
-        rice_ks [rice_k + 1]++;
-
-    putbits (rice_k + 1, 5, bs);    // the Rice k parameter (offset 1) is stored in the first 5 bits
-
-    if (rice_k > 0) {
-        uint32_t mask = (1UL << rice_k) - 1;
+    if (half_rice_k > 1) {
+        int full_rice_k = half_rice_k >> 1;
+        uint32_t split = (half_rice_k & 1) ? ((1UL << full_rice_k) * 12 + 15) / 29 : 0;
+        uint32_t shortcodes = (1UL << full_rice_k) - split;
+        uint32_t numcodes = (1UL << full_rice_k) + split;
 
         while (sample_count--) {
             uint32_t avalue = signed_to_non_negative (*audio_samples);
-            int modulo = avalue >> rice_k;
+            int modulo = avalue / numcodes;
 
             while (modulo--)
                 putbit_1 (bs);
 
             putbit_0 (bs);
-            avalue &= mask;
-            putbits (avalue, rice_k, bs);
+            avalue %= numcodes;
+
+            if (avalue < shortcodes)
+                putbits (avalue, full_rice_k, bs);
+            else {
+                avalue += shortcodes;
+                putbits (avalue >> 1, full_rice_k, bs);
+                putbit (avalue & 1, bs);
+            }
+
             audio_samples += stride;
         }
     }
-    else if (rice_k == 0)
+    else if (half_rice_k == 1)
+        while (sample_count--) {
+            uint32_t avalue = signed_to_non_negative (*audio_samples);
+            int modulo = avalue * 2 / 3, ones_count = modulo;
+
+            while (modulo--)
+                putbit_1 (bs);
+
+            putbit_0 (bs);
+
+            if (!(ones_count & 1))
+                putbit ((avalue % 3) & 1, bs);
+
+            audio_samples += stride;
+        }
+    else if (half_rice_k == 0)
         while (sample_count--) {
             uint32_t avalue = signed_to_non_negative (*audio_samples);
 
@@ -217,6 +276,51 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
             putbit_0 (bs);
             audio_samples += stride;
         }
+
+    return bs_bits_written (bs);
+}
+
+static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+{
+    int rice_k_guess = best_rice_k (audio_samples, sample_count, stride), rice_k_best;
+    int best_bitcount = sample_count * 32, trial_bitcount;
+    Bitstream bs_save;
+
+    if (rice_k_guess < 0) {
+        if (sample_count > MAX_DECORR)  // only count the "real" blocks in the statistics
+            rice_ks [0]++;
+
+        putbits (0, 6, bs);
+        return;
+    }
+
+    rice_k_best = rice_k_guess *= 2;
+
+    for (int rice_k_trial = rice_k_guess - 1; rice_k_trial <= rice_k_guess + 1; rice_k_trial += 2)
+        if (rice_k_trial >= 0 && rice_k_trial != rice_k_guess) {
+            bs_save = *bs;
+            trial_bitcount = entropy_encode_halfrice (bs, audio_samples, sample_count, stride, rice_k_trial);
+            *bs = bs_save;
+
+            if (trial_bitcount < best_bitcount) {
+                best_bitcount = trial_bitcount;
+                rice_k_best = rice_k_trial;
+            }
+        }
+
+    bs_save = *bs;
+
+    if (entropy_encode_halfrice (bs, audio_samples, sample_count, stride, rice_k_guess) > best_bitcount) {
+        *bs = bs_save;
+        entropy_encode_halfrice (bs, audio_samples, sample_count, stride, rice_k_best);
+    }
+    else
+        rice_k_best = rice_k_guess;
+
+    if (sample_count > MAX_DECORR) {    // only count the "real" blocks in the statistics
+        rice_off [rice_k_best - rice_k_guess + 1]++;
+        rice_ks [rice_k_best + 1]++;
+    }
 }
 
 // Calculate the optimum Rice k parameter (i.e. number of bits sent literally
@@ -395,13 +499,13 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count)
 void dump_compression_stats (FILE *file)
 {
     int maxnz = -1, i;
-    char string [256];
+    char string [512];
 
     fprintf (file, "decorr: (%ld) %ld %ld %ld %ld %ld %ld %ld\n",
         (long) decorrs[0], (long) decorrs[1], (long) decorrs[2], (long) decorrs[3],
         (long) decorrs[4], (long) decorrs[5], (long) decorrs[6], (long) decorrs[7]);
 
-    for (i = 0; i < 32; ++i) if (rice_ks [i]) maxnz = i;
+    for (i = 0; i < 64; ++i) if (rice_ks [i]) maxnz = i;
     for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), i ? " %ld" : " (%ld)", (long) rice_ks [i]);
     fprintf (file, "rice-k:%s (max = %d)\n", string, maxnz - 1);
 
@@ -411,9 +515,13 @@ void dump_compression_stats (FILE *file)
         fprintf (file, "shifts:%s (max = %d)\n", string, maxnz);
     }
 
+    if (rice_off [0] + rice_off [2])
+        fprintf (file, "rice offsets: %d (%d) %d\n", rice_off [0], rice_off [1], rice_off [2]);
+
     memset (decorrs, 0, sizeof (decorrs));
     memset (rice_ks, 0, sizeof (rice_ks));
     memset (shifts, 0, sizeof (shifts));
+    memset (rice_off, 0, sizeof (rice_off));
 }
 
 /****************************** DECOMPRESSION ********************************/
@@ -495,18 +603,22 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 
 static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
 {
-    int rice_k;
+    int half_rice_k;
 
-    getbits (&rice_k, 5, bs);   // Rice K is offset by 1 (so we send -1 for silence)
-    rice_k = (rice_k & 0x1f) - 1;
+    getbits (&half_rice_k, 6, bs);   // Rice K is offset by 1 (so we send -1 for silence)
+    half_rice_k = (half_rice_k & 0x3f) - 1;
 
-    if (rice_k < 0)             // if silence, just clear the samples and get out
+    if (half_rice_k < 0)             // if silence, just clear the samples and get out
         while (sample_count--) {
             *audio_samples = 0;
             audio_samples += stride;
         }
-    else if (rice_k > 0) {      // normal case for k > 0
-        uint32_t mask = (1UL << rice_k) - 1, rice_k_bits;
+    else if (half_rice_k > 1) {      // normal case for k > 0
+        int full_rice_k = half_rice_k >> 1;
+        uint32_t mask = (1UL << full_rice_k) - 1, rice_k_bits;
+        uint32_t split = (half_rice_k & 1) ? ((1UL << full_rice_k) * 12 + 15) / 29 : 0;
+        uint32_t shortcodes = (1UL << full_rice_k) - split;
+        uint32_t numcodes = (1UL << full_rice_k) + split;
 
         while (sample_count--) {
             uint32_t avalue = 0;
@@ -514,14 +626,35 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
             while (getbit (bs))
                 avalue++;
 
-            avalue <<= rice_k;
-            getbits (&rice_k_bits, rice_k, bs);
-            avalue |= (rice_k_bits & mask);
+            avalue *= numcodes;
+            getbits (&rice_k_bits, full_rice_k, bs);
+            rice_k_bits &= mask;
+
+            if (rice_k_bits < shortcodes)
+                avalue += rice_k_bits;
+            else
+                avalue += (rice_k_bits << 1) + getbit (bs) - shortcodes;
+
             *audio_samples = non_negative_to_signed (avalue);
             audio_samples += stride;
         }
     }
-    else                        // optimized case for k == 0
+    else if (half_rice_k == 1)       // optimized case for k == 1 (weird 2 bits per 3 codes version)
+        while (sample_count--) {
+            uint32_t avalue = 0;
+
+            while (getbit (bs))
+                avalue++;
+
+            if (avalue & 1)
+                avalue = avalue + (avalue >> 1) + 1;
+            else
+                avalue = avalue + (avalue >> 1) + getbit (bs);
+
+            *audio_samples = non_negative_to_signed (avalue);
+            audio_samples += stride;
+        }
+    else if (half_rice_k == 0)       // optimized case for k == 0
         while (sample_count--) {
             uint32_t avalue = 0;
 

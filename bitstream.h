@@ -175,3 +175,11 @@ static uint32_t bs_close_write (Bitstream *bs)
     memset (bs, 0, sizeof (*bs));
     return bytes_written;
 }
+
+// This function returns the total number of bits written so far to
+// the specified stream. This is just a query, it is non-distructive.
+
+static uint32_t bs_bits_written (const Bitstream *bs)
+{
+    return (uint32_t)(bs->ptr - bs->buf) * 8 + bs->bc;
+}
