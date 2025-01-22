@@ -22,8 +22,12 @@
 
 #define MONO_MODE   0
 #define DUAL_MONO   1
-#define MID_SIDE    2
+#define MID_SIDE    2   // stereo coding modes from best to worst, generally
 #define LEFT_RIGHT  3
+#define RIGHT_SIDE  4
+#define LEFT_SIDE   5
+#define RIGHT_MID   6   // actually right+sum because right+mid isn't enough
+#define LEFT_MID    7   // actually left+sum because left+mid isn't enough
 
 #ifdef __cplusplus
 extern "C" {

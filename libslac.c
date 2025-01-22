@@ -17,6 +17,54 @@
 // No allocation is used; everything is done in place using the passed input
 // and output buffers.
 
+//                          Notes on this Version
+//                          ---------------------
+
+// This is an experimental version of SLAC to determine whether advanced stereo
+// encoding modes (beyond mid+side) can be beneficial. Four additional modes
+// are implemented in libslac (left+side, right+side, left+mid, and right+mid)
+// and code has been added to main to try various subsets of these modes (like
+// the existing -j2 does) but with the addition of an optional "sparse" setting
+// which provides a big speed boost without significant compression degradation.
+//
+// The outcome is that adding left+side and right+side provide a 0.08% improvement
+// over just left+right and mid+side on my standard test corpus (which has lots
+// of content variation). However, I tried another large concert file that I
+// normally use for speed tests that showed a 0.38% improvement. The right+mid
+// and left+mid provide an additional tiny improvement, but almost certainly not
+// worth the extra time to check. Note that they are really right+sum and
+// left+sum because "mid" is not sufficient for lossless when combined with
+// left or right.
+//
+// Here's how the modes performed on my test corpus and the second file mentioned:
+//
+// -j1 (mid+side)       56.46%  58.04%
+// -j0 (left+right)     56.86%  58.76%
+// -j3 (right+side)     57.03%  58.75%
+// -j4 (left+side)      57.30%  58.09%
+// -j6 (right+mid)      59.12%  61.84%
+// -j7 (left+mid)       59.40%  61.18%
+//
+// -j2 (best of 0-1)    56.03%  57.91%
+// -j5 (best of 0-4)    55.95%  57.53%
+// -j8 (best of all 6)  55.95%  57.53%
+//
+// One thing that initially surprised me was that left+side and right+side
+// perform worse on average than left+right, unlike mid+side which generally
+// performs better than left+right (which is why it's the default). This
+// implies that, independent of "side", "mid" compresses better than left and
+// right do. This seems unintuitive at first because it's simply the average
+// of them, so one would expect the compression to be somewhere between them.
+//
+// I suspect that this is because, depending on how the stereo mix is created,
+// there are phase differences between the channels caused by varying arrival
+// times. At higher frequencies these phase differences would be greater,
+// and so mixing the channels together reduces the high frequencies more than
+// low frequencies, which makes them easier to compress. This is why pushing
+// the mono button on a receiver often seems to dull the sound. Of course, if
+// a stereo recording is made purely with level panning, this would not take
+// place.
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -101,6 +149,10 @@ static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
 static int best_decorr (int32_t *audio_samples, int sample_count, int stride);
 static int channels_identical (int32_t *audio_samples, int sample_count);
 static void lr_to_ms (int32_t *audio_samples, int sample_count);
+static void lr_to_rs (int32_t *audio_samples, int sample_count);
+static void lr_to_ls (int32_t *audio_samples, int sample_count);
+static void lr_to_rm (int32_t *audio_samples, int sample_count);
+static void lr_to_lm (int32_t *audio_samples, int sample_count);
 
 // Compress an array of audio samples (in either 1 or 2 interleaved channels)
 // into the provided buffer (which should be big enough for the data). The
@@ -127,16 +179,24 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
         }
         else if (stereo_mode == MID_SIDE)
             lr_to_ms (audio_samples, sample_count);
+        else if (stereo_mode == RIGHT_SIDE)
+            lr_to_rs (audio_samples, sample_count);
+        else if (stereo_mode == LEFT_SIDE)
+            lr_to_ls (audio_samples, sample_count);
+        else if (stereo_mode == RIGHT_MID)
+            lr_to_rm (audio_samples, sample_count);
+        else if (stereo_mode == LEFT_MID)
+            lr_to_lm (audio_samples, sample_count);
         else
             stereo_mode = LEFT_RIGHT;
     }
     else
         stereo_mode = MONO_MODE;
 
-    // open the bitstream for writing and store the stereo mode in the first two bits
+    // open the bitstream for writing and store the stereo mode in the first three bits
 
     bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
-    putbits (stereo_mode, 2, &bs);
+    putbits (stereo_mode, 3, &bs);
 
     // the channels (1 or 2) are processed completely independently and sequentially here
 
@@ -388,6 +448,42 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count)
     }
 }
 
+// left-right to left-side
+static void lr_to_ls (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] = audio_samples [0] - audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
+// left-right to right-side
+static void lr_to_rs (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] -= audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
+// left-right to left-mid
+static void lr_to_lm (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] += audio_samples [0];     // in this case "mid" is really "sum"
+        audio_samples += 2;
+    }
+}
+
+// left-right to right-mid
+static void lr_to_rm (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] += audio_samples [1];     // in this case "mid" is really "sum"
+        audio_samples += 2;
+    }
+}
+
 /******************************** STATISTICS *********************************/
 
 // Display some encoder statistics to the specified stream.
@@ -421,6 +517,10 @@ void dump_compression_stats (FILE *file)
 static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift);
 static void ms_to_lr (int32_t *audio_samples, int sample_count);
+static void rs_to_lr (int32_t *audio_samples, int sample_count);
+static void ls_to_lr (int32_t *audio_samples, int sample_count);
+static void rm_to_lr (int32_t *audio_samples, int sample_count);
+static void lm_to_lr (int32_t *audio_samples, int sample_count);
 static void dm_to_lr (int32_t *audio_samples, int sample_count);
 
 // Decompress the supplied compressed audio data into the original samples.
@@ -436,11 +536,11 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     int read_chans = num_chans, res = 0, stereo_mode, chan;
     Bitstream bs;
 
-    // open the passed buffer as a bitstream and get the first 2 bits (stereo mode)
+    // open the passed buffer as a bitstream and get the first 3 bits (stereo mode)
 
     bs_open_read (&bs, inbuffer, inbuffer + inbufsize);
-    getbits (&stereo_mode, 2, &bs);
-    stereo_mode &= 0x3;
+    getbits (&stereo_mode, 3, &bs);
+    stereo_mode &= 0x7;
 
     if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
@@ -475,9 +575,16 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     }
 
     // if stereo and not simply stored left-right, we might have one more step
-
     if (stereo_mode == MID_SIDE)
         ms_to_lr (audio_samples, sample_count);
+    else if (stereo_mode == LEFT_SIDE)
+        ls_to_lr (audio_samples, sample_count);
+    else if (stereo_mode == RIGHT_SIDE)
+        rs_to_lr (audio_samples, sample_count);
+    else if (stereo_mode == LEFT_MID)
+        lm_to_lr (audio_samples, sample_count);
+    else if (stereo_mode == RIGHT_MID)
+        rm_to_lr (audio_samples, sample_count);
     else if (stereo_mode == DUAL_MONO)
         dm_to_lr (audio_samples, sample_count);
 
@@ -557,11 +664,46 @@ static void dm_to_lr (int32_t *audio_samples, int sample_count)
 
 // Converts the supplied buffer of stereo samples from mid-side encoding back
 // to left-right encoding.
-
 static void ms_to_lr (int32_t *audio_samples, int sample_count)
 {
     while (sample_count--) {
         audio_samples [0] += (audio_samples [1] -= (audio_samples [0] >> 1));
+        audio_samples += 2;
+    }
+}
+
+// left-side to left-right
+static void ls_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] = audio_samples [0] - audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
+// right-side to left-right
+static void rs_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] = audio_samples [0] + audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
+// left-mid to left-right
+static void lm_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] = audio_samples [1] - audio_samples [0];
+        audio_samples += 2;
+    }
+}
+
+// right-mid to left-right
+static void rm_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] = audio_samples [0] - audio_samples [1];
         audio_samples += 2;
     }
 }
