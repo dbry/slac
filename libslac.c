@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////
 //                           ****** SLAC ******                           //
 //                    Simple Lossless Audio Compressor                    //
-//                 Copyright (c) 2019 - 2022 David Bryant                 //
+//                 Copyright (c) 2019 - 2025 David Bryant                 //
 //                          All Rights Reserved.                          //
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
@@ -99,88 +99,54 @@ static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics o
 static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride);
 static int best_decorr (int32_t *audio_samples, int sample_count, int stride);
-static int channels_identical (int32_t *audio_samples, int sample_count);
-static void lr_to_ms (int32_t *audio_samples, int sample_count);
 
-// Compress an array of audio samples (in either 1 or 2 interleaved channels)
-// into the provided buffer (which should be big enough for the data). The
-// return value is the number of bytes used (rounded up to the next word) or
-// -1 indicating an error. The stereo_mode only applies if num_chans is 2
-// (obviously) and can be either MID_SIDE or LEFT_RIGHT (see libslac.h). Note
-// that selecting the better of left-right and mid-side encoding is not done
-// here, but can easily be done at the next higher level by simply performing
-// this operation for both methods and choosing the smaller.
+// Compress an array of audio samples into the provided buffer (which should
+// be big enough for the data). The return value is the number of bytes used
+// or -1 indicating an error.
 
 // Note: the audio samples are processed in place, they are not "const" !!
 
-int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize)
+int compress_audio_buffer (int32_t *audio_samples, int sample_count, int stride, char *outbuffer, int outbufsize)
 {
-    int sent_chans = num_chans, chan;
+    int shift, decorr;
     Bitstream bs;
 
-    // this is the processing unique to stereo...from here on it's just 1 or 2 mono channels
+    bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
 
-    if (num_chans == 2) {
-        if (channels_identical (audio_samples, sample_count)) {
-            stereo_mode = DUAL_MONO;
-            sent_chans = 1;
-        }
-        else if (stereo_mode == MID_SIDE)
-            lr_to_ms (audio_samples, sample_count);
-        else
-            stereo_mode = LEFT_RIGHT;
+    // check whether there are LSB zeros in every sample that can be shifted out
+
+    shift = redundant_bits (audio_samples, sample_count, stride);
+    shifts [shift]++;
+
+    // find the best decorrelator (from -1 to 6) and write that to the stream in 3 bits
+
+    decorr = best_decorr (audio_samples, sample_count, stride);
+    putbits (decorr + 1, 3, &bs);
+    decorrs [decorr + 1]++;
+
+    // since the shift amount is generally small, store that in unary (1's followed by 0)
+    while (shift--)
+        putbit_1 (&bs);
+
+    putbit_0 (&bs);
+
+    // because the magnitude of the first few samples can be very different than the rest
+    // of the data (because they're not as decorrelated), we store those using their own
+    // Rice parameter; this only costs 5 bits per channel, but can make a huge improvement
+
+    if (decorr && abs (decorr) < sample_count) {
+        entropy_encode (&bs, audio_samples, abs (decorr), stride);
+        entropy_encode (&bs, audio_samples + abs (decorr) * stride, sample_count - abs (decorr), stride);
     }
     else
-        stereo_mode = MONO_MODE;
-
-    // open the bitstream for writing and store the stereo mode in the first two bits
-
-    bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
-    putbits (stereo_mode, 2, &bs);
-
-    // the channels (1 or 2) are processed completely independently and sequentially here
-
-    for (chan = 0; chan < sent_chans; ++chan) {
-        int shift, decorr;
-
-        // check whether there are LSB zeros in every sample that can be shifted out
-
-        shift = redundant_bits (audio_samples + chan, sample_count, num_chans);
-        shifts [shift]++;
-
-        // find the best decorrelator (from -1 to 6) and write that to the stream in 3 bits
-
-        decorr = best_decorr (audio_samples + chan, sample_count, num_chans);
-        putbits (decorr + 1, 3, &bs);
-        decorrs [decorr + 1]++;
-
-        // since the shift amount is generally small, store that in unary (1's followed by 0)
-        while (shift--)
-            putbit_1 (&bs);
-
-        putbit_0 (&bs);
-
-        // because the magnitude of the first few samples can be very different than the rest
-        // of the data (because they're not as decorrelated), we store those using their own
-        // Rice parameter; this only costs 5 bits per channel, but can make a huge improvement
-
-        if (decorr && abs (decorr) < sample_count) {
-            entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans);
-            entropy_encode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans);
-        }
-        else
-            entropy_encode (&bs, audio_samples + chan, sample_count, num_chans);
-    }
+        entropy_encode (&bs, audio_samples, sample_count, stride);
 
     return bs_close_write (&bs);    // close the bitstream and return the number of bytes written
 }
 
 static int best_rice_k (int32_t *audio_samples, int sample_count, int stride);
 
-// Encode the supplied array of samples into a bitstream using Rice encoding.
-// If stereo data is being compressed the channels must be processed in two
-// separate passes and the stride parameter should be 2 and the pointer set to
-// the first sample of the desired channel.
+// Encode the supplied array of mono samples into a bitstream using Rice encoding.
 
 static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
 {
@@ -359,35 +325,6 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
     return best_decorr_index;
 }
 
-// Scans the provided stereo samples to see if they are identical and can
-// therefore be encoded as a "dual-mono" block. To avoid delays, we break out
-// of the loop as soon as we se a difference (which would normally be the
-// first or second sample).
-
-static int channels_identical (int32_t *audio_samples, int sample_count)
-{
-    while (sample_count--)
-        if (audio_samples [0] == audio_samples [1])
-            audio_samples += 2;
-        else
-            return 0;
-
-    return 1;
-}
-
-// Converts the supplied buffer of stereo samples from left-right encoding to
-// mid-side encoding. Note that since L+R and L-R have identical LSBs, we
-// don't really need to store the LSB of both, which is why it's "mid" instead
-// of "sum".
-
-static void lr_to_ms (int32_t *audio_samples, int sample_count)
-{
-    while (sample_count--) {
-        audio_samples [1] += ((audio_samples [0] -= audio_samples [1]) >> 1);
-        audio_samples += 2;
-    }
-}
-
 /******************************** STATISTICS *********************************/
 
 // Display some encoder statistics to the specified stream.
@@ -420,71 +357,51 @@ void dump_compression_stats (FILE *file)
 
 static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift);
-static void ms_to_lr (int32_t *audio_samples, int sample_count);
-static void dm_to_lr (int32_t *audio_samples, int sample_count);
 
-// Decompress the supplied compressed audio data into the original samples.
-// Note that the number of samples and channels must be passed in, so these
-// must be stored with the block somehow (although checking that both of the
-// 2 LSB's of the first compressed data byte are zero can be used to determine
-// if the block is mono, although this is kind of cheating). All the compressed
-// data provided by compress_audio_block() must be present, or -1 will be
-// returned indicating an error.
+// Decompress the supplied compressed audio data into the original samples. Note
+// that the number of samples must be passed in, so these must be stored with the
+// block somehow. All the compressed data provided by compress_audio_buffer() must
+// be present, or -1 will be returned indicating an error, otherwise the number
+// of compressed bytes actually consumed is returned.
 
-int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, char *inbuffer, int inbufsize)
+int decompress_audio_buffer (int32_t *audio_samples, int sample_count, int stride, char *inbuffer, int inbufsize)
 {
-    int read_chans = num_chans, res = 0, stereo_mode, chan;
+    int shift = 0, decorr;
     Bitstream bs;
 
-    // open the passed buffer as a bitstream and get the first 2 bits (stereo mode)
+    // open the passed buffer as a bitstream
 
     bs_open_read (&bs, inbuffer, inbuffer + inbufsize);
-    getbits (&stereo_mode, 2, &bs);
-    stereo_mode &= 0x3;
 
-    if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
-        read_chans = 1;
+    getbits (&decorr, 3, &bs);      // the first 3 bits for each channel is the decorrelation info
+    decorr = (decorr & 0x7) - 1;
 
-    for (chan = 0; chan < read_chans && !bs.error; ++chan) {
-        int shift = 0, decorr;
+    while (getbit (&bs))            // the number of 1's that follow is the final left-shift amount
+        shift++;
 
-        getbits (&decorr, 3, &bs);      // the first 3 bits for each channel is the decorrelation info
-        decorr = (decorr & 0x7) - 1;
+    // as with encoding, we read the first few still correlated samples in a separate Rice operation
 
-        while (getbit (&bs))            // the number of 1's that follow is the final left-shift amount
-            shift++;
-
-        // as with encoding, we read the first few still correlated samples in a separate Rice operation
-
-        if (decorr && abs (decorr) < sample_count) {
-            entropy_decode (&bs, audio_samples + chan, abs (decorr), num_chans);
-            entropy_decode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans);
-        }
-        else
-            entropy_decode (&bs, audio_samples + chan, sample_count, num_chans);
-
-        // next undo the decorrelation step, and finally the shift
-
-        if (decorr < 0)
-            decorrelate (audio_samples + chan, sample_count, num_chans);
-        else while (decorr--)
-            correlate (audio_samples + chan, sample_count, num_chans);
-
-        if (shift)
-            leftshift_bits (audio_samples + chan, sample_count, num_chans, shift);
+    if (decorr && abs (decorr) < sample_count) {
+        entropy_decode (&bs, audio_samples, abs (decorr), stride);
+        entropy_decode (&bs, audio_samples + abs (decorr) * stride, sample_count - abs (decorr), stride);
     }
+    else
+        entropy_decode (&bs, audio_samples, sample_count, stride);
 
-    // if stereo and not simply stored left-right, we might have one more step
+    // next undo the decorrelation step, and finally the shift
 
-    if (stereo_mode == MID_SIDE)
-        ms_to_lr (audio_samples, sample_count);
-    else if (stereo_mode == DUAL_MONO)
-        dm_to_lr (audio_samples, sample_count);
+    if (decorr < 0)
+        decorrelate (audio_samples, sample_count, stride);
+    else while (decorr--)
+        correlate (audio_samples, sample_count, stride);
 
-    res = bs.error;         // if we went past the end of the buffer, flag an error
-    bs_close_read (&bs);
+    if (shift)
+        leftshift_bits (audio_samples, sample_count, stride, shift);
 
-    return res;
+    if (!bs.error)
+        return bs_close_read (&bs);
+    else
+        return -1;
 }
 
 // Decode the supplied array of samples from the bitstream using Rice encoding.
@@ -541,28 +458,6 @@ static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride
     while (sample_count--) {
         * (uint32_t *) audio_samples <<= shift;
         audio_samples += stride;
-    }
-}
-
-// Duplicate the single left stereo channel into both channels for decoding
-// "dual-mono" mode.
-
-static void dm_to_lr (int32_t *audio_samples, int sample_count)
-{
-    while (sample_count--) {
-        audio_samples [1] = audio_samples [0];
-        audio_samples += 2;
-    }
-}
-
-// Converts the supplied buffer of stereo samples from mid-side encoding back
-// to left-right encoding.
-
-static void ms_to_lr (int32_t *audio_samples, int sample_count)
-{
-    while (sample_count--) {
-        audio_samples [0] += (audio_samples [1] -= (audio_samples [0] >> 1));
-        audio_samples += 2;
     }
 }
 

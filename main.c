@@ -27,9 +27,16 @@
 
 #include "libslac.h"
 
+#define MONO_MODE   0
+#define DUAL_MONO   1
+#define LEFT_RIGHT  2
+#define MID_SIDE    3
+#define LEFT_SIDE   4
+#define SIDE_RIGHT  5
+
 static const char *sign_on = "\n"
-" SLAC  Simple Lossless Audio Compressor Demo  Version 0.3\n"
-" Copyright (c) 2022 David Bryant. All Rights Reserved.\n\n";
+" SLAC  Simple Lossless Audio Compressor Demo  Version 0.5\n"
+" Copyright (c) 2025 David Bryant. All Rights Reserved.\n\n";
 
 static const char *usage =
 " Usage:     SLAC [-options] infile.wav outfile.slac\n"
@@ -39,8 +46,8 @@ static const char *usage =
 "           -bn    = override block samples (default = 1024)\n"
 "           -h     = display this help message\n"
 "           -j0    = encode stereo files as L/R\n"
-"           -j1    = encode stereo files as M/S (default)\n"
-"           -j2    = encode stereo files using best (slow)\n"
+"           -j1    = encode stereo files as M/S\n"
+"           -j2    = encode stereo files best (default)\n"
 "           -q     = quiet mode (display errors only)\n"
 "           -r     = raw output (no WAV header written)\n"
 "           -v     = verbose (display lots of info)\n"
@@ -56,7 +63,14 @@ static int decode_slac_to_wav (char *infilename, char *outfilename);
 static void little_endian_to_native (void *data, char *format);
 static void native_to_little_endian (void *data, char *format);
 
-static int block_samples = 1024, joint_stereo = 1;
+static int chans_equ (int32_t *audio_samples, int sample_count);
+static void lr_to_ms (int32_t *audio_samples, int sample_count);
+static void dm_to_lr (int32_t *audio_samples, int sample_count);
+static void ms_to_lr (int32_t *audio_samples, int sample_count);
+static void ls_to_lr (int32_t *audio_samples, int sample_count);
+static void sr_to_lr (int32_t *audio_samples, int sample_count);
+
+static int block_samples = 1024, joint_stereo = 2;
 static int verbose_mode, quiet_mode, raw_decode;
 
 int main (argc, argv) int argc; char **argv;
@@ -283,7 +297,7 @@ static int encode_wav_to_slac (char *infilename, char *outfilename)
                 if (bits_per_sample != 8 && bits_per_sample != 16 && bits_per_sample != 24)
                     supported = 0;
 
-                if (!WaveHeader.NumChannels || WaveHeader.NumChannels > 2 ||
+                if (!WaveHeader.NumChannels || WaveHeader.NumChannels > 8 ||
                     WaveHeader.BlockAlign / WaveHeader.NumChannels < (bits_per_sample + 7) / 8 ||
                     WaveHeader.BlockAlign / WaveHeader.NumChannels > 3 ||
                     WaveHeader.BlockAlign % WaveHeader.NumChannels)
@@ -388,7 +402,7 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
     char encoded_block [256 + block_samples * 4 * num_chans];
     uint32_t samples_left = total_samples, total_bytes = 0;
     int32_t audio_block [block_samples * num_chans];
-    int block_count = 0, stereo [4] = { 0 };
+    int block_count = 0, stereo [6] = { 0 };
 
     while (samples_left) {
         int samples_to_read = block_samples, samples_read, cnt;
@@ -430,45 +444,88 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
                 break;
         }
 
-        int block_bytes;
+        int block_bytes = 0, stereo_mode = LEFT_RIGHT;
 
-        if (num_chans == 2 && joint_stereo == 2) {
-            char mid_side_encoded_block [256 + block_samples * 4 * num_chans];
-            int32_t mid_side_audio_block [block_samples * num_chans];
+        if (num_chans == 2 && chans_equ (audio_block, samples_read)) {
+            block_bytes = compress_audio_buffer (audio_block, samples_read, num_chans, encoded_block, sizeof (encoded_block));
+            stereo_mode = DUAL_MONO;
+        }
+        else if (num_chans == 2 && joint_stereo == 1) {
+            lr_to_ms (audio_block, samples_read);
+            block_bytes = compress_audio_buffer (audio_block, samples_read, num_chans, encoded_block, sizeof (encoded_block));
+            block_bytes += compress_audio_buffer (audio_block + 1, samples_read, num_chans, encoded_block + block_bytes, sizeof (encoded_block) - block_bytes);
+            stereo_mode = MID_SIDE;
+        }
+        else if (num_chans == 2 && joint_stereo == 2) {
+            int encoded_bytes_left, encoded_bytes_right, encoded_bytes_mid, encoded_bytes_side;
+            int32_t audio_block_copy [block_samples * num_chans];
+            char encoded_left  [256 + block_samples * 4];
+            char encoded_right [256 + block_samples * 4];
+            char encoded_mid   [256 + block_samples * 4];
+            char encoded_side  [256 + block_samples * 4];
 
-            memcpy (mid_side_audio_block, audio_block, block_samples * num_chans * sizeof (int32_t));
+            memcpy (audio_block_copy, audio_block, samples_read * num_chans * sizeof (int32_t));
+            encoded_bytes_left = compress_audio_buffer (audio_block_copy, samples_read, num_chans, encoded_left, sizeof (encoded_left));
+            encoded_bytes_right = compress_audio_buffer (audio_block_copy + 1, samples_read, num_chans, encoded_right, sizeof (encoded_right));
 
-            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, LEFT_RIGHT,
-                encoded_block, sizeof (encoded_block));
+            lr_to_ms (audio_block, samples_read);
+            encoded_bytes_mid = compress_audio_buffer (audio_block, samples_read, num_chans, encoded_mid, sizeof (encoded_mid));
+            encoded_bytes_side = compress_audio_buffer (audio_block + 1, samples_read, num_chans, encoded_side, sizeof (encoded_side));
 
-            if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {
-                fprintf (stderr, "compress_audio_block() returned error or overflow, block_bytes = %d\n", block_bytes);
-                return -1;
+            block_bytes = encoded_bytes_mid + encoded_bytes_side;
+            stereo_mode = MID_SIDE;
+
+            if (encoded_bytes_left + encoded_bytes_right < block_bytes) {
+                block_bytes = encoded_bytes_left + encoded_bytes_right;
+                stereo_mode = LEFT_RIGHT;
             }
 
-            if ((encoded_block [0] & 0x3) == LEFT_RIGHT) {
-                int mid_side_block_bytes = compress_audio_block (mid_side_audio_block, samples_read, num_chans, MID_SIDE,
-                    mid_side_encoded_block, sizeof (encoded_block));
+            if (encoded_bytes_right + encoded_bytes_side < block_bytes) {
+                block_bytes = encoded_bytes_right + encoded_bytes_side;
+                stereo_mode = SIDE_RIGHT;
+            }
 
-                if (mid_side_block_bytes < block_bytes) {
-                    memcpy (encoded_block, mid_side_encoded_block, mid_side_block_bytes);
-                    block_bytes = mid_side_block_bytes;
-                }
+            if (encoded_bytes_left + encoded_bytes_side < block_bytes) {
+                block_bytes = encoded_bytes_left + encoded_bytes_side;
+                stereo_mode = LEFT_SIDE;
+            }
+
+            switch (stereo_mode) {
+                case MID_SIDE:
+                    memcpy (encoded_block, encoded_mid, encoded_bytes_mid);
+                    memcpy (encoded_block + encoded_bytes_mid, encoded_side, encoded_bytes_side);
+                    break;
+
+                case LEFT_RIGHT:
+                    memcpy (encoded_block, encoded_left, encoded_bytes_left);
+                    memcpy (encoded_block + encoded_bytes_left, encoded_right, encoded_bytes_right);
+                    break;
+
+                case SIDE_RIGHT:
+                    memcpy (encoded_block, encoded_side, encoded_bytes_side);
+                    memcpy (encoded_block + encoded_bytes_side, encoded_right, encoded_bytes_right);
+                    break;
+
+                case LEFT_SIDE:
+                    memcpy (encoded_block, encoded_left, encoded_bytes_left);
+                    memcpy (encoded_block + encoded_bytes_left, encoded_side, encoded_bytes_side);
+                    break;
             }
         }
-        else
-            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, joint_stereo ? MID_SIDE : LEFT_RIGHT,
-                encoded_block, sizeof (encoded_block));
+        else {
+            for (int chan = 0; chan < num_chans; ++chan)
+                block_bytes += compress_audio_buffer (audio_block + chan, samples_read, num_chans, encoded_block + block_bytes, sizeof (encoded_block) - block_bytes);
 
-        if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {
-            fprintf (stderr, "compress_audio_block() returned error or overflow, block_bytes = %d\n", block_bytes);
-            return -1;
+            stereo_mode = num_chans == 2 ? LEFT_RIGHT : MONO_MODE;
         }
 
-        stereo [encoded_block [0] & 0x3]++;
+        stereo [stereo_mode]++;
+
         fwrite ("slac", 1, 4, outfile);
-        fputc (block_bytes >> 1, outfile);
-        fputc ((block_bytes >> 9) | (bytes_per_sample << 4), outfile);
+        fputc (num_chans, outfile);
+        fputc (stereo_mode, outfile);
+        fputc (block_bytes, outfile);
+        fputc ((block_bytes >> 8) | (bytes_per_sample << 6), outfile);
         fputc (samples_read, outfile);
         fputc ((samples_read >> 8) | (sample_rate << 4), outfile);
         fwrite (encoded_block, 1, block_bytes, outfile);
@@ -489,11 +546,41 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
     if (verbose_mode) {
         dump_compression_stats (stderr);
 
-        if (stereo [1] || stereo [2] || stereo [3])
-            fprintf (stderr, "dual-mono = %d, mid+side = %d, left+right = %d\n", stereo [1], stereo [2], stereo [3]);
+        if (stereo [1] || stereo [2] || stereo [3] || stereo [4] || stereo [5])
+            fprintf (stderr, "dual-mono = %d, left+right = %d, mid+side = %d, left+side = %d, right+side = %d\n",
+                stereo [1], stereo [2], stereo [3], stereo [4], stereo [5]);
     }
 
     return 0;
+}
+
+// Scans the provided stereo samples to see if they are identical and can
+// therefore be encoded as a "dual-mono" block. To avoid delays, we break out
+// of the loop as soon as we se a difference (which would normally be the
+// first or second sample).
+
+static int chans_equ (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--)
+        if (audio_samples [0] == audio_samples [1])
+            audio_samples += 2;
+        else
+            return 0;
+
+    return 1;
+}
+
+// Converts the supplied buffer of stereo samples from left-right encoding to
+// mid-side encoding. Note that since L+R and R-L have identical LSBs, we
+// don't really need to store the LSB of both, which is why it's "mid" instead
+// of "sum".
+
+static void lr_to_ms (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] += ((audio_samples [1] -= audio_samples [0]) >> 1);
+        audio_samples += 2;
+    }
 }
 
 /***************************** DECODE SLAC TO WAV *****************************/
@@ -502,7 +589,7 @@ static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_ch
 
 static int decode_slac_to_wav (char *infilename, char *outfilename)
 {
-    int block_byte_count, sample_count, bytes_per_sample = 0, num_chans = 0, res = 0;
+    int block_byte_count, sample_count, bytes_per_sample = 0, num_chans = 0, stereo_mode = 0, res = 0;
     uint32_t total_samples = 0, sample_rate = 0;
     FILE *infile, *outfile;
 
@@ -549,15 +636,25 @@ static int decode_slac_to_wav (char *infilename, char *outfilename)
         if ((ch = fgetc (infile)) == EOF)
             break;
 
-        block_byte_count = ch << 1;
+        num_chans = ch;
 
         if ((ch = fgetc (infile)) == EOF)
             break;
 
-        block_byte_count |= (ch << 9) & 0x1F00;
-        bytes_per_sample = (ch >> 4) & 0x3;
+        stereo_mode = ch;
 
-        if (!block_byte_count)
+        if ((ch = fgetc (infile)) == EOF)
+            break;
+
+        block_byte_count = ch;
+
+        if ((ch = fgetc (infile)) == EOF)
+            break;
+
+        block_byte_count |= (ch << 8) & 0x3F00;
+        bytes_per_sample = (ch >> 6) & 0x3;
+
+        if (!block_byte_count || !bytes_per_sample)
             break;
 
         if ((ch = fgetc (infile)) == EOF)
@@ -576,15 +673,42 @@ static int decode_slac_to_wav (char *infilename, char *outfilename)
         if (fread (block_buffer, 1, block_byte_count, infile) != block_byte_count)
             break;
 
-        num_chans = (block_buffer [0] & 0x3) ? 2 : 1;
         sample_buffer = malloc (sample_count * num_chans * sizeof (int32_t));
         raw_output_buffer = malloc (sample_count * num_chans * bytes_per_sample);
 
-        if (decompress_audio_block (sample_buffer, sample_count, num_chans, block_buffer, block_byte_count)) {
-            fprintf (stderr, "decompress_audio_block() returned error!\n");
+        int block_bytes_used = 0;
+
+        for (int chan = 0; chan < num_chans; ++chan) {
+            block_bytes_used += decompress_audio_buffer (sample_buffer + chan, sample_count, num_chans, block_buffer + block_bytes_used, block_byte_count - block_bytes_used);
+
+            if (stereo_mode == DUAL_MONO)
+                break;
+        }
+
+        if (block_bytes_used != block_byte_count) {
+            fprintf (stderr, "buffer not completely used!\n");
             res = -1;
             break;
         }
+
+        if (num_chans == 2 && stereo_mode != LEFT_RIGHT)
+            switch (stereo_mode) {
+                case DUAL_MONO:
+                    dm_to_lr (sample_buffer, sample_count);
+                    break;
+
+                case MID_SIDE:
+                    ms_to_lr (sample_buffer, sample_count);
+                    break;
+
+                case LEFT_SIDE:
+                    ls_to_lr (sample_buffer, sample_count);
+                    break;
+
+                case SIDE_RIGHT:
+                    sr_to_lr (sample_buffer, sample_count);
+                    break;
+            }
 
         int count = sample_count * num_chans;
         int32_t *src = sample_buffer, temp;
@@ -630,6 +754,42 @@ static int decode_slac_to_wav (char *infilename, char *outfilename)
     fclose (outfile);
 
     return res;
+}
+
+// dual-mono to left-right
+static void dm_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] = audio_samples [0];
+        audio_samples += 2;
+    }
+}
+
+// mid-side to left-right
+static void ms_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] += (audio_samples [0] -= (audio_samples [1] >> 1));
+        audio_samples += 2;
+    }
+}
+
+// left-side to left-right
+static void ls_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] += audio_samples [0];
+        audio_samples += 2;
+    }
+}
+
+// side-right to left-right
+static void sr_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] = audio_samples [1] - audio_samples [0];
+        audio_samples += 2;
+    }
 }
 
 static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate)

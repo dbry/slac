@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////
 //                           ****** SLAC ******                           //
 //                    Simple Lossless Audio Compressor                    //
-//                    Copyright (c) 2019 David Bryant.                    //
+//                    Copyright (c) 2025 David Bryant.                    //
 //                          All Rights Reserved.                          //
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
@@ -118,10 +118,6 @@ static uint32_t bs_close_read (Bitstream *bs)
         bs->ptr++;
 
     bytes_read = (uint32_t)(bs->ptr - bs->buf);
-
-    if (!(bytes_read & 1))
-        ++bytes_read;
-
     memset (bs, 0, sizeof (*bs));
     return bytes_read;
 }
@@ -160,18 +156,10 @@ static uint32_t bs_close_write (Bitstream *bs)
     if (bs->error)
         return (uint32_t) -1;
 
-    while (1) {
-        while (bs->bc)
-            putbit_1 (bs);
+    while (bs->bc)
+        putbit_1 (bs);
 
-        bytes_written = (uint32_t)(bs->ptr - bs->buf);
-
-        if (bytes_written & 1)
-            putbit_1 (bs);
-        else
-            break;
-    }
-
+    bytes_written = (uint32_t)(bs->ptr - bs->buf);
     memset (bs, 0, sizeof (*bs));
     return bytes_written;
 }
