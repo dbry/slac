@@ -175,7 +175,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
     return bs_close_write (&bs);    // close the bitstream and return the number of bytes written
 }
 
-static int best_rice_k (int32_t *audio_samples, int sample_count, int stride);
+static int best_rice_k (const int32_t *audio_samples, int sample_count, int stride);
 
 // Encode the supplied array of samples into a bitstream using Rice encoding.
 // If stereo data is being compressed the channels must be processed in two
@@ -220,42 +220,38 @@ static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_co
 }
 
 // Calculate the optimum Rice k parameter (i.e. number of bits sent literally
-// for each sample) for the supplied sample data. We calculate the sum of all
-// the (converted to non-negative) sample values which requires more than just
-// 32 bits of magnitude. To avoid requiring a 64-bit integer type (which some
-// platforms don't have) or a float (which can be slow on some platforms) this
-// is done with a 32-bit unsigned integer and another integer for overflows.
-// Just the final calculation is done in floats. If there are only zero samples
+// for each sample) for the supplied sample data. If all the samples are zero
 // this function returns -1 so that silent blocks can be efficiently handled.
 
-static int best_rice_k (int32_t *audio_samples, int sample_count, int stride)
+static int best_rice_k (const int32_t *audio_samples, int sample_count, int stride)
 {
-    int count = sample_count, upper32 = 0, rice_k = 0;
-    float float_sum = 0, min_bits;
-    int32_t *dptr = audio_samples;
-    uint32_t lower32 = 0;
+    uint32_t sum_bits = 0, min_bits;
+    int rice_k = 0, i;
 
-    while (count--) {
-        uint32_t temp = lower32;
+    // go through the samples initially calculating the sum of all the samples
+    // but bump the rice_k and right shift the sum when we exceed 32 bits per
+    // sample (which is definitely too high)
 
-        if ((lower32 += signed_to_non_negative (*dptr)) < temp)
-            upper32++;
+    for (i = 0; i < sample_count; ++i) {
+        if ((sum_bits += (uint32_t) signed_to_non_negative (*audio_samples) >> rice_k) > sample_count * 32) {
+            sum_bits = (sum_bits + 1) >> 1;
+            rice_k++;
+        }
 
-        dptr += stride;
+        audio_samples += stride;
     }
 
-    if (!upper32 && !lower32)        // return -1 for complete silence
+    if (!sum_bits)                  // return -1 for complete silence
         return -1;
 
-    float_sum = upper32 * 4294967296.0 + lower32;
-    min_bits = float_sum + sample_count;
+    min_bits = sum_bits + (1 + rice_k) * sample_count;
 
-    // min_bits this is now the exact total number of bits used for encoding the
-    // samples with k=0; next we'll increase k and estimate the resulting bit
+    // min_bits this is now the total number of bits used for encoding all the
+    // samples with k=rice_k; next we'll increase k and estimate the resulting bit
     // count as long as it continues to improve
 
     while (1) {
-        float bits = (float_sum /= 2) + (++rice_k * sample_count) + sample_count - (sample_count / 6);
+        uint32_t bits = (sum_bits >>= 1) + ((1 + ++rice_k) * sample_count) - (sample_count / 6);
 
         if (bits < min_bits)
             min_bits = bits;
