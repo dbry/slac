@@ -87,3 +87,28 @@ The compression algorithm uses only standard techniques:
    encoded with their own Rice parameter because they often have wildly
    different magnitudes than the majority of the samples. Also, a check is
    made for all the samples being zero, in which case nothing is encoded.
+
+6. There are several experimental versions or variations of SLAC that may be
+   of interest. These are in separate branches and not official or guaranteed
+   to be correct, but they may be informative or useful:
+
+   branch name              description
+   -------------------------------------------------------------------------------
+   experimental-speedup         uses new functions in bitstream.h to read and
+                                write unary counts, plus some other changes
+                                resulting in significant speedup (bit-compatible
+                                with existing code)
+
+   experimental-k-zones         provides for a sequence of Rice 'k' values for
+                                each frame for improved compression with little
+                                decoding speed penalty (not compatible with
+                                existing code)
+
+   experimental-stereo-modes    adds left+side, right+side, left+sum and
+                                right+sum to supported stereo modes providing
+                                some compression improvement (not compatible
+                                with existing code)
+
+   experimental-half-rice-codes uses codes midway between the standard Rice
+                                power-of-two 'k' values to improve compression,
+                                especially with smaller values (like 8-bit)
