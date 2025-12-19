@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////
 //                           ****** SLAC ******                           //
 //                    Simple Lossless Audio Compressor                    //
-//                 Copyright (c) 2019 - 2022 David Bryant                 //
+//                 Copyright (c) 2019 - 2025 David Bryant                 //
 //                          All Rights Reserved.                          //
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
@@ -16,6 +16,41 @@
 //
 // No allocation is used; everything is done in place using the passed input
 // and output buffers.
+
+//                          Notes on this Version
+//                          ---------------------
+
+// This is an experimental version of SLAC that uses two different versions
+// of the "decorrelation" process. In addition to the simple "difference"
+// version used up until now where each sample is replaced by the difference
+// between it and the previous sample:
+//
+//   [1]  S'[0] = S[0] - S[-1]
+//
+// a new version is introduced that uses the two previous values in the
+// calculation:
+//
+//                       3*S[-1] - S[-2]
+//   [2]  S'[0] = S[0] - ---------------
+//                              2
+//
+// This provides more decorrelation than the simple difference version and
+// has been shown to be more suited for subsequent decorrelation steps,
+// perhaps because it boosts the highest frequencies less than a pair of
+// the simpler versions. An adaptive version of it is used extensively in
+// WavPack.
+//
+// These larger decorrelation steps are used repeatedly as before (until
+// the result is worse, then backing off one) and then we try the old
+// style decorrelation pass in either direction to fine-tune the result.
+// The decorrelation factor is stored for the decoder as before, with the
+// new version counting as 2 for each pass, and the old version as 1. The
+// values range from -1 to 10 and are stored, offset by 1, in 4 bits
+// (previously 3).
+//
+// Overall, this has a modest hit on encoding speed (from the fine-tuning
+// step), a negligible effect on decoding speed, and provides about 0.5%
+// better compression overall.
 
 #include <stdio.h>
 #include <stdint.h>
@@ -85,14 +120,16 @@ static inline int count_leading_zeros (uint32_t x)
 #define signed_to_non_negative(x)   (((uint32_t)(x)<<1)^((int32_t)(x)>>31))
 #define non_negative_to_signed(x)   ((int32_t)(-(int32_t)((x)&1)^(x))>>1)
 
-#define MAX_DECORR 6
+#define MAX_DECORR 10
 
 // Complementary decorrelate / correlate functions used by both encoding and decoding
 
-static int decorrelate (int32_t *audio_samples, int sample_count, int stride);
-static int correlate (int32_t *audio_samples, int sample_count, int stride);
+static int decorrelate1 (int32_t *audio_samples, int sample_count, int stride);
+static int correlate1 (int32_t *audio_samples, int sample_count, int stride);
+static int decorrelate2 (int32_t *audio_samples, int sample_count, int stride);
+static void correlate2 (int32_t *audio_samples, int sample_count, int stride);
 
-static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics only
+static int32_t decorrs [16], rice_ks [32], shifts [32];  // used for statistics only
 
 /******************************* COMPRESSION *********************************/
 
@@ -148,10 +185,10 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
         shift = redundant_bits (audio_samples + chan, sample_count, num_chans);
         shifts [shift]++;
 
-        // find the best decorrelator (from -1 to 6) and write that to the stream in 3 bits
+        // find the best decorrelator (from -1 to 10) and write that to the stream in 4 bits
 
         decorr = best_decorr (audio_samples + chan, sample_count, num_chans);
-        putbits (decorr + 1, 3, &bs);
+        putbits (decorr + 1, 4, &bs);
         decorrs [decorr + 1]++;
 
         // since the shift amount is generally small, store that in unary (1's followed by 0)
@@ -323,33 +360,49 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
     int best_magnitude = magnitude_bits (audio_samples, sample_count, stride);
     int decorr_index = 0, best_decorr_index = 0;
 
-    // first, continue to call decorrelate() until the result gets worse, then back up 1
+    // first, continue to call decorrelate2() until the result gets worse, then back up 2
 
-    while (decorr_index < MAX_DECORR) {
-        int magnitude = decorrelate (audio_samples, sample_count, stride); decorr_index++;
+    while (decorr_index < MAX_DECORR - 1) {
+        int magnitude = decorrelate2 (audio_samples, sample_count, stride); decorr_index += 2;
 
         if (magnitude < best_magnitude) {
             best_decorr_index = decorr_index;
             best_magnitude = magnitude;
         }
         else {
-            correlate (audio_samples, sample_count, stride); decorr_index--;
+            correlate2 (audio_samples, sample_count, stride); decorr_index -= 2;
             break;
         }
     }
 
-    // if that didn't work at all, maybe negative decorrelation (i.e. correlation) will
+    // try -1 (which requires backing up 2 first)
+
+    if (decorr_index >= 2) {
+        correlate2 (audio_samples, sample_count, stride);
+
+        if (decorrelate1 (audio_samples, sample_count, stride) < best_magnitude)
+            return decorr_index - 1;
+
+        correlate1 (audio_samples, sample_count, stride);
+        decorrelate2 (audio_samples, sample_count, stride);
+    }
+
+    // try +1
+
+    if (decorr_index < MAX_DECORR) {
+        if (decorrelate1 (audio_samples, sample_count, stride) < best_magnitude)
+            return decorr_index + 1;
+
+        correlate1 (audio_samples, sample_count, stride);
+    }
+
+    // if nothing worked at all, maybe negative decorrelation (i.e. correlation) will
 
     if (decorr_index == 0) {
-        int magnitude = correlate (audio_samples, sample_count, stride); decorr_index--;
+        if (correlate1 (audio_samples, sample_count, stride) < best_magnitude)
+            return decorr_index - 1;
 
-        if (magnitude < best_magnitude) {
-            best_decorr_index = decorr_index;
-            best_magnitude = magnitude;
-        }
-        else {
-            decorrelate (audio_samples, sample_count, stride); decorr_index++;
-        }
+        decorrelate1 (audio_samples, sample_count, stride);
     }
 
     return best_decorr_index;
@@ -390,12 +443,14 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count)
 
 void dump_compression_stats (FILE *file)
 {
-    int maxnz = -1, i;
+    int maxnz = -1, maxdc = -1, i;
     char string [256];
 
-    fprintf (file, "decorr: (%ld) %ld %ld %ld %ld %ld %ld %ld\n",
+    for (i = 0; i < 16; ++i) if (decorrs [i]) maxdc = i;
+    fprintf (file, "decorr: (%ld) %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld (max = %d)\n",
         (long) decorrs[0], (long) decorrs[1], (long) decorrs[2], (long) decorrs[3],
-        (long) decorrs[4], (long) decorrs[5], (long) decorrs[6], (long) decorrs[7]);
+        (long) decorrs[4], (long) decorrs[5], (long) decorrs[6], (long) decorrs[7],
+        (long) decorrs[8], (long) decorrs[9], (long) decorrs[10], (long) decorrs[11], maxdc - 1);
 
     for (i = 0; i < 32; ++i) if (rice_ks [i]) maxnz = i;
     for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), i ? " %ld" : " (%ld)", (long) rice_ks [i]);
@@ -444,8 +499,8 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     for (chan = 0; chan < read_chans && !bs.error; ++chan) {
         int shift = 0, decorr;
 
-        getbits (&decorr, 3, &bs);      // the first 3 bits for each channel is the decorrelation info
-        decorr = (decorr & 0x7) - 1;
+        getbits (&decorr, 4, &bs);      // the first 4 bits for each channel is the decorrelation info
+        decorr = (decorr & 0xf) - 1;
 
         while (getbit (&bs))            // the number of 1's that follow is the final left-shift amount
             shift++;
@@ -459,12 +514,19 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
         else
             entropy_decode (&bs, audio_samples + chan, sample_count, num_chans);
 
-        // next undo the decorrelation step, and finally the shift
+        // next undo the decorrelation step(s), and finally the shift
 
         if (decorr < 0)
-            decorrelate (audio_samples + chan, sample_count, num_chans);
-        else while (decorr--)
-            correlate (audio_samples + chan, sample_count, num_chans);
+            decorrelate1 (audio_samples + chan, sample_count, num_chans);
+        else {
+            if (decorr & 1)
+                correlate1 (audio_samples + chan, sample_count, num_chans);
+
+            decorr >>= 1;
+
+            while (decorr--)
+                correlate2 (audio_samples + chan, sample_count, num_chans);
+        }
 
         if (shift)
             leftshift_bits (audio_samples + chan, sample_count, num_chans, shift);
@@ -576,10 +638,10 @@ static void ms_to_lr (int32_t *audio_samples, int sample_count)
 // the value returned by magnitude_bits() that can be used to determine if
 // the operation reduced the average magnitude of the samples.
 
-static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
+static int decorrelate1 (int32_t *audio_samples, int sample_count, int stride)
 {
     int bits = sample_count * 31;
-    uint32_t temp = 0;
+    int32_t temp = 0;
 
     while (sample_count--) {
         temp += *audio_samples -= temp;
@@ -590,10 +652,10 @@ static int decorrelate (int32_t *audio_samples, int sample_count, int stride)
     return bits;
 }
 
-static int correlate (int32_t *audio_samples, int sample_count, int stride)
+static int correlate1 (int32_t *audio_samples, int sample_count, int stride)
 {
     int bits = sample_count * 31;
-    uint32_t value = 0;
+    int32_t value = 0;
 
     while (sample_count--) {
         value = *audio_samples += value;
@@ -602,4 +664,33 @@ static int correlate (int32_t *audio_samples, int sample_count, int stride)
     }
 
     return bits;
+}
+
+static int decorrelate2 (int32_t *audio_samples, int sample_count, int stride)
+{
+    int32_t temp1 = 0, temp2 = 0;
+    int bits = sample_count * 31;
+
+    while (sample_count--) {
+        int32_t prediction = (temp1 * 3 - temp2) >> 1;
+        temp2 = temp1;
+        temp1 = *audio_samples;
+        *audio_samples -= prediction;
+        bits -= count_leading_zeros (signed_to_non_negative (*audio_samples) + 1);
+        audio_samples += stride;
+    }
+
+    return bits;
+}
+
+static void correlate2 (int32_t *audio_samples, int sample_count, int stride)
+{
+    int32_t value1 = 0, value2 = 0;
+
+    while (sample_count--) {
+        int32_t prediction = (value1 * 3 - value2) >> 1;
+        value2 = value1;
+        value1 = *audio_samples += prediction;
+        audio_samples += stride;
+    }
 }
