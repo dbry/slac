@@ -112,3 +112,7 @@ The compression algorithm uses only standard techniques:
    experimental-half-rice-codes uses codes midway between the standard Rice
                                 power-of-two 'k' values to improve compression,
                                 especially with smaller values (like 8-bit)
+
+   experimental-decorrelation   uses a new decorrelation function (along with
+                                the previous, simpler "difference" version) to
+                                improve the compression ratio about 0.5%
