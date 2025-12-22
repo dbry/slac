@@ -103,6 +103,8 @@ static int redundant_bits (int32_t *audio_samples, int sample_count, int stride)
 static int best_decorr (int32_t *audio_samples, int sample_count, int stride);
 static int channels_identical (int32_t *audio_samples, int sample_count);
 static void lr_to_ms (int32_t *audio_samples, int sample_count);
+static void lr_to_rs (int32_t *audio_samples, int sample_count);
+static void lr_to_ls (int32_t *audio_samples, int sample_count);
 
 // Compress an array of audio samples (in either 1 or 2 interleaved channels)
 // into the provided buffer (which should be big enough for the data). The
@@ -115,9 +117,9 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count);
 
 // Note: the audio samples are processed in place, they are not "const" !!
 
-int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize)
+int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int flags, char *outbuffer, int outbufsize)
 {
-    int sent_chans = num_chans, chan;
+    int sent_chans = num_chans, stereo_mode = flags & STEREO_MODE, chan;
     Bitstream bs;
 
     // this is the processing unique to stereo...from here on it's just 1 or 2 mono channels
@@ -129,6 +131,10 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
         }
         else if (stereo_mode == MID_SIDE)
             lr_to_ms (audio_samples, sample_count);
+        else if (stereo_mode == RIGHT_SIDE)
+            lr_to_rs (audio_samples, sample_count);
+        else if (stereo_mode == LEFT_SIDE)
+            lr_to_ls (audio_samples, sample_count);
         else
             stereo_mode = LEFT_RIGHT;
     }
@@ -138,7 +144,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
     // open the bitstream for writing and store the stereo mode in the first two bits
 
     bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
-    putbits (stereo_mode, 2, &bs);
+    putbits (stereo_mode, 3, &bs);
 
     // the channels (1 or 2) are processed completely independently and sequentially here
 
@@ -398,6 +404,24 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count)
     }
 }
 
+// left-right to left-side
+static void lr_to_ls (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] = audio_samples [0] - audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
+// left-right to right-side
+static void lr_to_rs (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] -= audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
 /******************************** STATISTICS *********************************/
 
 // Display some encoder statistics to the specified stream.
@@ -434,6 +458,8 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift);
 static void ms_to_lr (int32_t *audio_samples, int sample_count);
 static void dm_to_lr (int32_t *audio_samples, int sample_count);
+static void rs_to_lr (int32_t *audio_samples, int sample_count);
+static void ls_to_lr (int32_t *audio_samples, int sample_count);
 
 // Decompress the supplied compressed audio data into the original samples.
 // Note that the number of samples and channels must be passed in, so these
@@ -448,11 +474,11 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     int read_chans = num_chans, res = 0, stereo_mode, chan;
     Bitstream bs;
 
-    // open the passed buffer as a bitstream and get the first 2 bits (stereo mode)
+    // open the passed buffer as a bitstream and get the first 3 bits (stereo mode)
 
     bs_open_read (&bs, inbuffer, inbuffer + inbufsize);
-    getbits (&stereo_mode, 2, &bs);
-    stereo_mode &= 0x3;
+    getbits (&stereo_mode, 3, &bs);
+    stereo_mode &= STEREO_MODE;
 
     if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
@@ -502,6 +528,10 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 
     if (stereo_mode == MID_SIDE)
         ms_to_lr (audio_samples, sample_count);
+    else if (stereo_mode == LEFT_SIDE)
+        ls_to_lr (audio_samples, sample_count);
+    else if (stereo_mode == RIGHT_SIDE)
+        rs_to_lr (audio_samples, sample_count);
     else if (stereo_mode == DUAL_MONO)
         dm_to_lr (audio_samples, sample_count);
 
@@ -581,6 +611,26 @@ static void ms_to_lr (int32_t *audio_samples, int sample_count)
 {
     while (sample_count--) {
         audio_samples [0] += (audio_samples [1] -= (audio_samples [0] >> 1));
+        audio_samples += 2;
+    }
+}
+
+// left-side to left-right
+
+static void ls_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [1] = audio_samples [0] - audio_samples [1];
+        audio_samples += 2;
+    }
+}
+
+// right-side to left-right
+
+static void rs_to_lr (int32_t *audio_samples, int sample_count)
+{
+    while (sample_count--) {
+        audio_samples [0] = audio_samples [0] + audio_samples [1];
         audio_samples += 2;
     }
 }

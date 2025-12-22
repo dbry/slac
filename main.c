@@ -28,8 +28,8 @@
 #include "libslac.h"
 
 static const char *sign_on = "\n"
-" SLAC  Simple Lossless Audio Compressor Demo  Version 0.3\n"
-" Copyright (c) 2022 David Bryant. All Rights Reserved.\n\n";
+" SLAC  Simple Lossless Audio Compressor Demo  Version 0.5\n"
+" Copyright (c) 2025 David Bryant. All Rights Reserved.\n\n";
 
 static const char *usage =
 " Usage:     SLAC [-options] infile.wav outfile.slac\n"
@@ -38,9 +38,10 @@ static const char *usage =
 " Options:  -d     = decode operation (default = encode))\n"
 "           -bn    = override block samples (default = 1024)\n"
 "           -h     = display this help message\n"
-"           -j0    = encode stereo files as L/R\n"
-"           -j1    = encode stereo files as M/S (default)\n"
-"           -j2    = encode stereo files using best (slow)\n"
+"           -j0    = encode stereo files as L+R\n"
+"           -j1    = encode stereo files as M+S\n"
+"           -j2    = encode stereo using detected best mode (default)\n"
+"           -j3    = encode stereo using detected best mode (slower)\n"
 "           -q     = quiet mode (display errors only)\n"
 "           -r     = raw output (no WAV header written)\n"
 "           -v     = verbose (display lots of info)\n"
@@ -90,8 +91,8 @@ int main (int argc, char **argv)
                     case 'J': case 'j':
                         joint_stereo = strtol (++*argv, argv, 10);
 
-                        if (joint_stereo < 0 || joint_stereo > 2) {
-                            fprintf (stderr, "\njoint stereo must be 0 to 2!\n");
+                        if (joint_stereo < 0 || joint_stereo > 3) {
+                            fprintf (stderr, "\njoint stereo must be 0 to 3!\n");
                             return -1;
                         }
 
@@ -384,14 +385,16 @@ static int encode_wav_to_slac (char *infilename, char *outfilename)
 
 static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int num_chans, int sample_rate, int bytes_per_sample)
 {
+    int current_stereo_mode = joint_stereo ? MID_SIDE : LEFT_RIGHT;
+    int next_stereo_mode = current_stereo_mode ^ MID_SIDE ^ LEFT_RIGHT;
     unsigned char raw_audio_block [block_samples * num_chans * bytes_per_sample];
     char encoded_block [256 + block_samples * 4 * num_chans];
     uint32_t samples_left = total_samples, total_bytes = 0;
     int32_t audio_block [block_samples * num_chans];
-    int block_count = 0, stereo [4] = { 0 };
+    int block_count = 0, stereo [8] = { 0 };
 
     while (samples_left) {
-        int samples_to_read = block_samples, samples_read, cnt;
+        int samples_to_read = block_samples, samples_read, block_bytes, cnt;
         unsigned char *sptr = raw_audio_block;
         int32_t *dptr = audio_block;
 
@@ -430,15 +433,14 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
                 break;
         }
 
-        int block_bytes;
+        if (num_chans == 2 && joint_stereo >= 2 && (encoded_block [0] & STEREO_MODE) == current_stereo_mode && (joint_stereo == 3 || !(block_count & 3))) {
+            char alternate_encoded_block [256 + block_samples * 4 * num_chans];
+            int32_t alternate_audio_block [block_samples * num_chans];
+            int alternate_block_bytes;
 
-        if (num_chans == 2 && joint_stereo == 2) {
-            char mid_side_encoded_block [256 + block_samples * 4 * num_chans];
-            int32_t mid_side_audio_block [block_samples * num_chans];
+            memcpy (alternate_audio_block, audio_block, block_samples * num_chans * sizeof (int32_t));
 
-            memcpy (mid_side_audio_block, audio_block, block_samples * num_chans * sizeof (int32_t));
-
-            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, LEFT_RIGHT,
+            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, current_stereo_mode,
                 encoded_block, sizeof (encoded_block));
 
             if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {
@@ -446,26 +448,34 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
                 return -1;
             }
 
-            if ((encoded_block [0] & 0x3) == LEFT_RIGHT) {
-                int mid_side_block_bytes = compress_audio_block (mid_side_audio_block, samples_read, num_chans, MID_SIDE,
-                    mid_side_encoded_block, sizeof (encoded_block));
+            alternate_block_bytes = compress_audio_block (alternate_audio_block, samples_read, num_chans, next_stereo_mode,
+                alternate_encoded_block, sizeof (alternate_encoded_block));
 
-                if (mid_side_block_bytes < block_bytes) {
-                    memcpy (encoded_block, mid_side_encoded_block, mid_side_block_bytes);
-                    block_bytes = mid_side_block_bytes;
-                }
+            if (alternate_block_bytes <= 0 || (alternate_block_bytes & 1) || alternate_block_bytes > 8190) {
+                fprintf (stderr, "compress_audio_block() returned error or overflow, block_bytes = %d\n", alternate_block_bytes);
+                return -1;
             }
+
+            if ((alternate_encoded_block [0] & STEREO_MODE) == next_stereo_mode && alternate_block_bytes < block_bytes) {
+                memcpy (encoded_block, alternate_encoded_block, block_bytes = alternate_block_bytes);
+                current_stereo_mode = next_stereo_mode;
+            }
+
+            while (++next_stereo_mode == current_stereo_mode || next_stereo_mode > LEFT_SIDE)
+                if (next_stereo_mode > LEFT_SIDE)
+                    next_stereo_mode = MID_SIDE - 1;
         }
-        else
-            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, joint_stereo ? MID_SIDE : LEFT_RIGHT,
+        else {
+            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, current_stereo_mode,
                 encoded_block, sizeof (encoded_block));
 
-        if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {
-            fprintf (stderr, "compress_audio_block() returned error or overflow, block_bytes = %d\n", block_bytes);
-            return -1;
+            if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {
+                fprintf (stderr, "compress_audio_block() returned error or overflow, block_bytes = %d\n", block_bytes);
+                return -1;
+            }
         }
 
-        stereo [encoded_block [0] & 0x3]++;
+        stereo [encoded_block [0] & 0x7]++;
         fwrite ("slac", 1, 4, outfile);
         fputc (block_bytes >> 1, outfile);
         fputc ((block_bytes >> 9) | (bytes_per_sample << 4), outfile);
@@ -489,7 +499,10 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
     if (verbose_mode) {
         dump_compression_stats (stderr);
 
-        if (stereo [1] || stereo [2] || stereo [3])
+        if (stereo [4] || stereo [5])
+            fprintf (stderr, "dual-mono = %d, mid+side = %d, left+right = %d, left+side = %d, right+side = %d\n",
+                stereo [1], stereo [2], stereo [3], stereo [4], stereo [5]);
+        else if (stereo [1] || stereo [2] || stereo [3])
             fprintf (stderr, "dual-mono = %d, mid+side = %d, left+right = %d\n", stereo [1], stereo [2], stereo [3]);
     }
 
@@ -576,7 +589,7 @@ static int decode_slac_to_wav (char *infilename, char *outfilename)
         if (fread (block_buffer, 1, block_byte_count, infile) != block_byte_count)
             break;
 
-        num_chans = (block_buffer [0] & 0x3) ? 2 : 1;
+        num_chans = (block_buffer [0] & STEREO_MODE) == MONO_MODE ? 1 : 2;
         sample_buffer = malloc (sample_count * num_chans * sizeof (int32_t));
         raw_output_buffer = malloc (sample_count * num_chans * bytes_per_sample);
 

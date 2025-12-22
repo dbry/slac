@@ -20,16 +20,21 @@
 #ifndef LIBSLAC_H
 #define LIBSLAC_H
 
+// "flags" assignments ("or" together)
+
+#define STEREO_MODE 0x7
 #define MONO_MODE   0
-#define DUAL_MONO   1
-#define MID_SIDE    2
+#define DUAL_MONO   1   // don't set this mode, will be detected automatically
+#define MID_SIDE    2   // stereo coding modes from best to worst, generally
 #define LEFT_RIGHT  3
+#define RIGHT_SIDE  4
+#define LEFT_SIDE   5
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize);
+int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int flags, char *outbuffer, int outbufsize);
 int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, char *inbuffer, int inbufsize);
 void dump_compression_stats (FILE *file);
 
