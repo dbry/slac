@@ -125,7 +125,7 @@ static int32_t decorrs [8], rice_ks [32], shifts [32];  // used for statistics o
 
 /******************************* COMPRESSION *********************************/
 
-static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags);
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride);
 static int best_decorr (int32_t *audio_samples, int sample_count, int stride);
 static int channels_identical (int32_t *audio_samples, int sample_count);
@@ -142,9 +142,9 @@ static void lr_to_ms (int32_t *audio_samples, int sample_count);
 
 // Note: the audio samples are processed in place, they are not "const" !!
 
-int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize)
+int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int flags, char *outbuffer, int outbufsize)
 {
-    int sent_chans = num_chans, chan;
+    int sent_chans = num_chans, stereo_mode = flags & 0x3, chan;
     Bitstream bs;
 
     // this is the processing unique to stereo...from here on it's just 1 or 2 mono channels
@@ -166,6 +166,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
 
     bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
     putbits (stereo_mode, 2, &bs);
+    putbit (flags & EXTRA_K_MASK, &bs);
 
     // the channels (1 or 2) are processed completely independently and sequentially here
 
@@ -194,18 +195,18 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
         // Rice parameter; this only costs 5 bits per channel, but can make a huge improvement
 
         if (decorr && abs (decorr) < sample_count) {
-            entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans);
-            entropy_encode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans);
+            entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans, flags);
+            entropy_encode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans, flags);
         }
         else
-            entropy_encode (&bs, audio_samples + chan, sample_count, num_chans);
+            entropy_encode (&bs, audio_samples + chan, sample_count, num_chans, flags);
     }
 
     return bs_close_write (&bs);    // close the bitstream and return the number of bytes written
 }
 
 static void entropy_encode_simple (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
-static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags);
 static int best_rice_k (const int32_t *audio_samples, int sample_count, int stride);
 
 // Encode the supplied array of samples into a bitstream using Rice encoding.
@@ -250,8 +251,8 @@ static void entropy_encode_simple (Bitstream *bs, int32_t *audio_samples, int sa
         }
 }
 
-#define MAX_NUM_ZONES 4     // 4 or 5 zones is the most efficient compromise
-                            //   (encode time vs. savings)
+#define MAX_NUM_ZONES 8     // number of k-zone slots to allocate
+
 // Zone 'k' Encoding
 // -----------------
 // 1. first 5 bits are initial 'k' (just like regular entropy encoder)
@@ -278,8 +279,9 @@ typedef struct {
 
 static int best_next_zone_bits (uint32_t *samples, int sample_count, Zone *zones, int *num_zones, int max_num_zones);
 
-static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags)
 {
+    int max_num_zones = ((flags & EXTRA_K_MASK) >> EXTRA_K_SHIFT) + 1;
     uint32_t bitcounter = bs_bits_written (bs);
     uint32_t samples [sample_count];
     Zone zones [MAX_NUM_ZONES];
@@ -288,7 +290,7 @@ static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sam
     for (int i = 0; i < sample_count; ++i)
         samples [i] = signed_to_non_negative (audio_samples [i * stride]);
 
-    int best_zones_result = best_next_zone_bits (samples, sample_count, zones, &num_zones, MAX_NUM_ZONES);
+    int best_zones_result = best_next_zone_bits (samples, sample_count, zones, &num_zones, max_num_zones);
 
     // num_zones == 0 signals silent block
 
@@ -363,12 +365,12 @@ static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sam
     }
 }
 
-static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags)
 {
-    if (sample_count < 64)
+    if (sample_count < 64 || !(flags & EXTRA_K_MASK))
         entropy_encode_simple (bs, audio_samples, sample_count, stride);
     else
-        entropy_encode_zones (bs, audio_samples, sample_count, stride);
+        entropy_encode_zones (bs, audio_samples, sample_count, stride, flags);
 }
 
 // Calculate the number of bits required to encode the given 'k' zone sequence
@@ -730,7 +732,7 @@ void dump_compression_stats (FILE *file)
 
 /****************************** DECOMPRESSION ********************************/
 
-static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int k_zones);
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift);
 static void ms_to_lr (int32_t *audio_samples, int sample_count);
 static void dm_to_lr (int32_t *audio_samples, int sample_count);
@@ -745,7 +747,7 @@ static void dm_to_lr (int32_t *audio_samples, int sample_count);
 
 int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, char *inbuffer, int inbufsize)
 {
-    int read_chans = num_chans, res = 0, stereo_mode, chan;
+    int read_chans = num_chans, res = 0, stereo_mode, k_zones, chan;
     Bitstream bs;
 
     // open the passed buffer as a bitstream and get the first 2 bits (stereo mode)
@@ -756,6 +758,8 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 
     if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
+
+    k_zones = getbit (&bs);
 
     for (chan = 0; chan < read_chans && !bs.error; ++chan) {
         int shift = 0, decorr;
@@ -769,11 +773,11 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
         // as with encoding, we read the first few still correlated samples in a separate Rice operation
 
         if (decorr && abs (decorr) < sample_count) {
-            entropy_decode (&bs, audio_samples + chan, abs (decorr), num_chans);
-            entropy_decode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans);
+            entropy_decode (&bs, audio_samples + chan, abs (decorr), num_chans, k_zones);
+            entropy_decode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans, k_zones);
         }
         else
-            entropy_decode (&bs, audio_samples + chan, sample_count, num_chans);
+            entropy_decode (&bs, audio_samples + chan, sample_count, num_chans, k_zones);
 
         // next undo the decorrelation step, and finally the shift
 
@@ -914,9 +918,9 @@ static void entropy_decode_zones (Bitstream *bs, int32_t *audio_samples, int sam
     }
 }
 
-static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int k_zones)
 {
-    if (sample_count < 64)
+    if (sample_count < 64 || !k_zones)
         entropy_decode_simple (bs, audio_samples, sample_count, stride);
     else
         entropy_decode_zones (bs, audio_samples, sample_count, stride);

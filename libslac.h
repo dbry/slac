@@ -25,11 +25,14 @@
 #define MID_SIDE    2
 #define LEFT_RIGHT  3
 
+#define EXTRA_K_SHIFT   4
+#define EXTRA_K_MASK    (0x7<<EXTRA_K_SHIFT)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int stereo_mode, char *outbuffer, int outbufsize);
+int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, int flags, char *outbuffer, int outbufsize);
 int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, char *inbuffer, int inbufsize);
 void dump_compression_stats (FILE *file);
 
