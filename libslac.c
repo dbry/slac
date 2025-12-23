@@ -100,8 +100,8 @@ static int32_t decorrs [16], k_zones [9], rice_ks [32], shifts [32];    // used 
 /******************************* COMPRESSION *********************************/
 
 static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags);
+static int best_decorr (int32_t *audio_samples, int sample_count, int stride, int flags);
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride);
-static int best_decorr (int32_t *audio_samples, int sample_count, int stride);
 static int channels_identical (int32_t *audio_samples, int sample_count);
 static void lr_to_ms (int32_t *audio_samples, int sample_count);
 static void lr_to_rs (int32_t *audio_samples, int sample_count);
@@ -161,7 +161,7 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
 
         // find the best decorrelator (from -1 to 10) and write that to the stream in 4 bits
 
-        decorr = best_decorr (audio_samples + chan, sample_count, num_chans);
+        decorr = best_decorr (audio_samples + chan, sample_count, num_chans, flags);
         putbits (decorr + 1, 4, &bs);
         decorrs [decorr + 1]++;
 
@@ -616,7 +616,7 @@ static int magnitude_bits (int32_t *audio_samples, int sample_count, int stride)
 // that many samples at the beginning of the buffer should be entropy encoded
 // separately because they will (in theory) have much greater mangnitudes.
 
-static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
+static int best_decorr (int32_t *audio_samples, int sample_count, int stride, int flags)
 {
     int best_magnitude = magnitude_bits (audio_samples, sample_count, stride);
     int decorr_index = 0, best_decorr_index = 0;
@@ -636,34 +636,39 @@ static int best_decorr (int32_t *audio_samples, int sample_count, int stride)
         }
     }
 
-    // try -1 (which requires backing up 2 first)
+    // stopping here gives good results, but we can refine the rather aggressive
+    // decorrelator with a finer one (but at some cost in encode speed)
 
-    if (decorr_index >= 2) {
-        correlate2 (audio_samples, sample_count, stride);
+    if (flags & FINE_DECORR) {
+        // try -1 (which requires backing up 2 first)
 
-        if (decorrelate1 (audio_samples, sample_count, stride) < best_magnitude)
-            return decorr_index - 1;
+        if (decorr_index >= 2) {
+            correlate2 (audio_samples, sample_count, stride);
 
-        correlate1 (audio_samples, sample_count, stride);
-        decorrelate2 (audio_samples, sample_count, stride);
-    }
+            if (decorrelate1 (audio_samples, sample_count, stride) < best_magnitude)
+                return decorr_index - 1;
 
-    // try +1
+            correlate1 (audio_samples, sample_count, stride);
+            decorrelate2 (audio_samples, sample_count, stride);
+        }
 
-    if (decorr_index < MAX_DECORR) {
-        if (decorrelate1 (audio_samples, sample_count, stride) < best_magnitude)
-            return decorr_index + 1;
+        // try +1
 
-        correlate1 (audio_samples, sample_count, stride);
-    }
+        if (decorr_index < MAX_DECORR) {
+            if (decorrelate1 (audio_samples, sample_count, stride) < best_magnitude)
+                return decorr_index + 1;
 
-    // if nothing worked at all, maybe negative decorrelation (i.e. correlation) will
+            correlate1 (audio_samples, sample_count, stride);
+        }
 
-    if (decorr_index == 0) {
-        if (correlate1 (audio_samples, sample_count, stride) < best_magnitude)
-            return decorr_index - 1;
+        // if nothing worked at all, maybe negative decorrelation (i.e. correlation) will
 
-        decorrelate1 (audio_samples, sample_count, stride);
+        if (decorr_index == 0) {
+            if (correlate1 (audio_samples, sample_count, stride) < best_magnitude)
+                return decorr_index - 1;
+
+            decorrelate1 (audio_samples, sample_count, stride);
+        }
     }
 
     return best_decorr_index;

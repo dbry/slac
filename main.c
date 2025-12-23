@@ -38,15 +38,21 @@ static const char *usage =
 " Options:  -d     = decode operation (default = encode))\n"
 "           -bn    = override block samples (default = 1024)\n"
 "           -h     = display this help message\n"
-"           -j0    = encode stereo files as L+R\n"
-"           -j1    = encode stereo files as M+S\n"
-"           -j2    = encode stereo using detected best mode (default)\n"
-"           -j3    = encode stereo using detected best mode (slower)\n"
+"           -f0    = coarse decorrelation (faster encode)\n"
+"           -f1    = finer decorrelation method (default)\n"
+"           -j0    = encode stereo files as L+R (faster encode)\n"
+"           -j1    = encode stereo files as M+S (faster encode)\n"
+"           -j2    = sparse detection of best stereo mode (default)\n"
+"           -j3    = finer detection of best stereo mode (slower)\n"
 "           -kn    = use up to 'n' k zones, default = 1, max = 8 (slow)\n"
 "           -q     = quiet mode (display errors only)\n"
 "           -r     = raw output (no WAV header written)\n"
 "           -v     = verbose (display lots of info)\n"
 "           -y     = overwrite outfile if it exists\n\n"
+" Notes:     * decode speed is roughly the same regardless of options\n"
+"            * encode speed is a good compromise of speed vs compression\n"
+"            * for faster encode speed, try adding -f0 and -j1 options\n"
+"            * for better compression, try adding -j3 and -k4 options\n\n"
 " Web:       Visit www.github.com/dbry/slac for latest version and info\n\n";
 
 static const uint32_t sample_rates [] = { 6000, 8000, 9600, 11025, 12000, 16000, 22050,
@@ -58,7 +64,7 @@ static int decode_slac_to_wav (char *infilename, char *outfilename);
 static void little_endian_to_native (void *data, char *format);
 static void native_to_little_endian (void *data, char *format);
 
-static int block_samples = 1024, joint_stereo = 2, k_zones = 1;
+static int block_samples = 1024, joint_stereo = 2, k_zones = 1, fine_decorr = 1;
 static int verbose_mode, quiet_mode, raw_decode;
 
 int main (int argc, char **argv)
@@ -89,6 +95,17 @@ int main (int argc, char **argv)
                         --*argv;
                         break;
 
+                    case 'F': case 'f':
+                        fine_decorr = strtol (++*argv, argv, 10);
+
+                        if (fine_decorr < 0 || fine_decorr > 1) {
+                            fprintf (stderr, "\nfine decorr must be 0 or 1!\n");
+                            return -1;
+                        }
+
+                        --*argv;
+                        break;
+
                     case 'J': case 'j':
                         joint_stereo = strtol (++*argv, argv, 10);
 
@@ -104,7 +121,7 @@ int main (int argc, char **argv)
                         k_zones = strtol (++*argv, argv, 10);
 
                         if (k_zones < 1 || k_zones > 8) {
-                            fprintf (stderr, "\nextra k zones must be 1 to 8!\n");
+                            fprintf (stderr, "\nk zones must be 1 to 8!\n");
                             return -1;
                         }
 
@@ -402,9 +419,14 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
     unsigned char raw_audio_block [block_samples * num_chans * bytes_per_sample];
     char encoded_block [256 + block_samples * 4 * num_chans];
     uint32_t samples_left = total_samples, total_bytes = 0;
-    int extra_k_flags = (k_zones - 1) << EXTRA_K_SHIFT;
     int32_t audio_block [block_samples * num_chans];
-    int block_count = 0, stereo [8] = { 0 };
+    int block_count = 0, flags = 0, stereo [8] = { 0 };
+
+    if (k_zones > 1)
+        flags |= (k_zones - 1) << EXTRA_K_SHIFT;
+
+    if (fine_decorr)
+        flags |= FINE_DECORR;
 
     while (samples_left) {
         int samples_to_read = block_samples, samples_read, block_bytes, cnt;
@@ -453,7 +475,7 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
 
             memcpy (alternate_audio_block, audio_block, block_samples * num_chans * sizeof (int32_t));
 
-            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, extra_k_flags | current_stereo_mode,
+            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, flags | current_stereo_mode,
                 encoded_block, sizeof (encoded_block));
 
             if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {
@@ -461,7 +483,7 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
                 return -1;
             }
 
-            alternate_block_bytes = compress_audio_block (alternate_audio_block, samples_read, num_chans, extra_k_flags | next_stereo_mode,
+            alternate_block_bytes = compress_audio_block (alternate_audio_block, samples_read, num_chans, flags | next_stereo_mode,
                 alternate_encoded_block, sizeof (alternate_encoded_block));
 
             if (alternate_block_bytes <= 0 || (alternate_block_bytes & 1) || alternate_block_bytes > 8190) {
@@ -479,7 +501,7 @@ static int encode_slac (FILE *infile, FILE *outfile, uint32_t total_samples, int
                     next_stereo_mode = MID_SIDE - 1;
         }
         else {
-            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, extra_k_flags | current_stereo_mode,
+            block_bytes = compress_audio_block (audio_block, samples_read, num_chans, flags | current_stereo_mode,
                 encoded_block, sizeof (encoded_block));
 
             if (block_bytes <= 0 || (block_bytes & 1) || block_bytes > 8190) {

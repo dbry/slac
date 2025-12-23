@@ -33,6 +33,8 @@
 #define EXTRA_K_SHIFT   4
 #define EXTRA_K_MASK    (0x7<<EXTRA_K_SHIFT)
 
+#define FINE_DECORR     0x100   // use finer decorrelation method to refine results
+
 #ifdef __cplusplus
 extern "C" {
 #endif
