@@ -233,6 +233,14 @@ static void bs_write (Bitstream *bs)
     }                                                           \
 } while (0)
 
+// This function returns the total number of bits written so far to
+// the specified stream. This is just a query, it is non-distructive.
+
+static uint32_t bs_bits_written (const Bitstream *bs)
+{
+    return (uint32_t)(bs->ptr - bs->buf) * 8 + bs->bc;
+}
+
 // This function forces a flushing write of the specified Bitstream, and
 // returns the total number of bytes written into the buffer, rounded up
 // to the next word, or -1 indicating an error (which is writing past

@@ -85,7 +85,8 @@ static inline int count_leading_zeros (uint32_t x)
 #define signed_to_non_negative(x)   (((uint32_t)(x)<<1)^((int32_t)(x)>>31))
 #define non_negative_to_signed(x)   ((int32_t)(-(int32_t)((x)&1)^(x))>>1)
 
-#define MAX_DECORR 10
+#define MAX_DECORR 10       // max decorrelation factor (stored in 4 bits)
+#define MAX_K_ZONES 8       // max number of k-zone slots to allocate
 
 // Complementary decorrelate / correlate functions used by both encoding and decoding
 
@@ -94,11 +95,11 @@ static int correlate1 (int32_t *audio_samples, int sample_count, int stride);
 static int decorrelate2 (int32_t *audio_samples, int sample_count, int stride);
 static void correlate2 (int32_t *audio_samples, int sample_count, int stride);
 
-static int32_t decorrs [16], rice_ks [32], shifts [32];  // used for statistics only
+static int32_t decorrs [16], k_zones [9], rice_ks [32], shifts [32];    // used for statistics only
 
 /******************************* COMPRESSION *********************************/
 
-static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags);
 static int redundant_bits (int32_t *audio_samples, int sample_count, int stride);
 static int best_decorr (int32_t *audio_samples, int sample_count, int stride);
 static int channels_identical (int32_t *audio_samples, int sample_count);
@@ -141,10 +142,12 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
     else
         stereo_mode = MONO_MODE;
 
-    // open the bitstream for writing and store the stereo mode in the first two bits
+    // open the bitstream for writing and store the stereo mode in the first three bits
+    // and then whether we are using multiple 'k' zones in one bit
 
     bs_open_write (&bs, outbuffer, outbuffer + outbufsize);
     putbits (stereo_mode, 3, &bs);
+    putbit (flags & EXTRA_K_MASK, &bs);
 
     // the channels (1 or 2) are processed completely independently and sequentially here
 
@@ -170,29 +173,42 @@ int compress_audio_block (int32_t *audio_samples, int sample_count, int num_chan
         // Rice parameter; this only costs 5 bits per channel, but can make a huge improvement
 
         if (decorr && abs (decorr) < sample_count) {
-            entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans);
-            entropy_encode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans);
+            entropy_encode (&bs, audio_samples + chan, abs (decorr), num_chans, flags);
+            entropy_encode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans, flags);
         }
         else
-            entropy_encode (&bs, audio_samples + chan, sample_count, num_chans);
+            entropy_encode (&bs, audio_samples + chan, sample_count, num_chans, flags);
     }
 
     return bs_close_write (&bs);    // close the bitstream and return the number of bytes written
 }
-
-static int best_rice_k (const int32_t *audio_samples, int sample_count, int stride);
 
 // Encode the supplied array of samples into a bitstream using Rice encoding.
 // If stereo data is being compressed the channels must be processed in two
 // separate passes and the stride parameter should be 2 and the pointer set to
 // the first sample of the desired channel.
 
-static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags);
+static void entropy_encode_simple (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+
+static void entropy_encode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags)
+{
+    if (sample_count < 64 || !(flags & EXTRA_K_MASK))
+        entropy_encode_simple (bs, audio_samples, sample_count, stride);
+    else
+        entropy_encode_zones (bs, audio_samples, sample_count, stride, flags);
+}
+
+static int best_rice_k (const int32_t *audio_samples, int sample_count, int stride);
+
+static void entropy_encode_simple (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
 {
     int rice_k = best_rice_k (audio_samples, sample_count, stride);
 
-    if (sample_count > MAX_DECORR)  // only count the "real" blocks in the statistics
+    if (sample_count > MAX_DECORR) {    // only count the "real" blocks in the statistics
+        k_zones [!!(rice_k + 1)]++;     // only 0 for silence or 1 for everything else
         rice_ks [rice_k + 1]++;
+    }
 
     putbits (rice_k + 1, 5, bs);    // the Rice k parameter (offset 1) is stored in the first 5 bits
 
@@ -257,6 +273,284 @@ static int best_rice_k (const int32_t *audio_samples, int sample_count, int stri
         else
             return rice_k - 1;
     }
+}
+
+// Zone 'k' Encoding
+// -----------------
+// 1. first 5 bits are initial 'k' (just like regular entropy encoder)
+// 2. each zone (up to MAX_K_ZONES - 1) follows:
+//
+// OPERATION    ENCODING BITS
+// ---------    -------------
+// terminate    0-0
+//  Δk = 0      0-1
+//  Δk = -1     1-1
+//  Δk = +1     1-1-0
+//  Δk = -2     1-1-1-0
+//  Δk = +2     1-1-1-1-0
+//  Δk = -3     1-1-1-1-1-0
+//    ...          ...
+
+// 3. no terminator required when MAX_K_ZONES is reached
+// 4. last specified 'k' zone is repeated indefinitely
+
+typedef struct {
+    uint32_t start_code, num_codes, mask, hits;
+    int k;
+} Zone;
+
+static int best_next_zone_bits (uint32_t *samples, int sample_count, Zone *zones, int *num_zones, int max_num_zones);
+
+static void entropy_encode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int flags)
+{
+    int max_num_zones = ((flags & EXTRA_K_MASK) >> EXTRA_K_SHIFT) + 1;
+    uint32_t bitcounter = bs_bits_written (bs);
+    uint32_t samples [sample_count];
+    Zone zones [MAX_K_ZONES];
+    int num_zones = 0, zone;
+
+    for (int i = 0; i < sample_count; ++i)
+        samples [i] = signed_to_non_negative (audio_samples [i * stride]);
+
+    int best_zones_result = best_next_zone_bits (samples, sample_count, zones, &num_zones, max_num_zones);
+
+    // num_zones == 0 signals silent block
+
+    if (!num_zones) {
+        putbits (0, 5, bs);
+        k_zones [0]++;
+        rice_ks [0]++;
+        return;
+    }
+
+    // k_zones [num_zones - 1]++;
+    rice_ks [zones [0].k + 1]++;
+    putbits (zones [0].k + 1, 5, bs);
+
+    for (zone = 1; zone < num_zones; ++zone) {
+        int delta_k = zones [zone].k - zones [zone - 1].k, j, ones;
+
+        if (delta_k == 0) {
+            for (j = zone + 1; j < num_zones; ++j)
+                if (zones [zone].k != zones [j].k)
+                    break;
+
+            if (j == num_zones) {
+                k_zones [zone]++;
+                zone = MAX_K_ZONES;
+                putbits (0, 2, bs);     // 0-0
+                break;
+            }
+        }
+
+        if (delta_k) {
+            ones = signed_to_non_negative (delta_k);
+
+            while (ones--)
+                putbit_1 (bs);
+
+            putbit_0 (bs);
+        }
+        else
+            putbits (2, 2, bs);         // 0-1
+    }
+
+    if (zone < MAX_K_ZONES)
+        putbits (0, 2, bs);             // 0-0
+
+    if (zone == num_zones)
+        k_zones [zone]++;
+
+    for (zone = 0; zone < num_zones; ++zone)
+        zones [zone].mask = (1UL << zones [zone].k) - 1;
+
+    for (int i = 0; i < sample_count; ++i) {
+        uint32_t avalue = samples [i];
+        int ones;
+
+        zone = 0;
+
+        while (++zone < num_zones)
+            if (avalue < zones [zone].start_code)
+                break;
+
+        avalue -= zones [--zone].start_code;
+        ones = (avalue >> zones [zone].k) + zone;
+        putcount (ones, bs);
+        avalue &= zones [zone].mask;
+        putbits (avalue, zones [zone].k, bs);
+    }
+
+    bitcounter = bs_bits_written (bs) - bitcounter;
+
+    if (bitcounter != best_zones_result) {
+        fprintf (stderr, "best_next_zone_bits() returned %d bits, but we wrote %d bits\n", best_zones_result, bitcounter);
+        exit (1);
+    }
+}
+
+// Calculate the number of bits required to encode the given 'k' zone sequence
+
+static int zone_overhead_bits (Zone *zones, int num_zones)
+{
+    int zone_bits = 5, zone;
+
+    for (zone = 1; zone < num_zones; ++zone) {
+        int delta_k = zones [zone].k - zones [zone - 1].k;
+
+        if (delta_k == 0) {
+            int j;
+
+            for (j = zone + 1; j < num_zones; ++j)
+                if (zones [zone].k != zones [j].k)
+                    break;
+
+            if (j == num_zones) {
+                zone = MAX_K_ZONES;
+                zone_bits += 2;
+                break;
+            }
+        }
+
+        if (delta_k)
+            zone_bits += signed_to_non_negative (delta_k) + 1;
+        else
+            zone_bits += 2;
+    }
+
+    if (zone < MAX_K_ZONES)
+        zone_bits += 2;
+
+    return zone_bits;
+}
+
+// Calculate the number of bits required to encode the given samples using up to "max_num_zones" zones. The
+// "zones" array is returned set to the best sequence and the "num_zones" parameter returns the number of zones
+// specified (the final zone is assumed repeated indefinitely). The "num_zones" value must be preset to zero
+// before calling this function. Note that this function is recursive.
+
+static int best_next_zone_bits (uint32_t *samples, int sample_count, Zone *zones, int *num_zones, int max_num_zones)
+{
+    int samples_left = sample_count, encoding_bits = 0, k_prev = -1, k_last = -1;
+    const int curr_zone = *num_zones;
+    uint32_t zone_start_code = 0;
+
+    if (curr_zone)
+        k_prev = zones [curr_zone - 1].k;
+
+    for (int i = 0; i < curr_zone; ++i) {
+        zone_start_code += 1UL << zones [i].k;
+        samples_left -= zones [i].hits;
+    }
+
+    if (!samples_left || max_num_zones <= 1) {
+        fprintf (stderr, "fatal error in best_next_zone_bits(), samples left = %d, max_num_zones = %d\n",
+            samples_left, max_num_zones);
+        exit (1);
+    }
+
+    if (curr_zone < max_num_zones - 1) {
+        uint16_t histogram [32] = { 0 };
+
+        for (int i = 0; i < sample_count; ++i)
+            if (samples [i] > zone_start_code)
+                histogram [32 - count_leading_zeros (samples [i] - zone_start_code)]++;
+            else if (samples [i] == zone_start_code)
+                histogram [0]++;
+
+        for (int i = 1; i < 32; ++i)
+            if ((histogram [i] += histogram [i - 1]) == samples_left && k_last < 0)
+                k_last = i;
+
+        if (curr_zone == 0 && histogram [0] == histogram [31]) {
+            zones [0].k = -1;
+            *num_zones = 0;
+            return 5;
+        }
+
+        for (int i = 0; i < 32; ++i)
+            if (histogram [i] * 2 >= samples_left) {
+                int k_low = i, k_high = i, best_num_zones = 0, trial_bits;
+                Zone trial_zones [max_num_zones];
+
+                memcpy (trial_zones, zones, sizeof (Zone) * curr_zone);
+
+                if (k_low && histogram [i] * 2 > samples_left)
+                    k_low--;
+
+                if (k_prev >= 0) {
+                    if      (k_prev < k_low)    k_low = k_prev;
+                    else if (k_prev > k_high)   k_high = k_prev;
+                }
+
+                for (int k = k_low; k <= k_high; ++k) {
+                    int trial_num_zones = curr_zone;
+
+                    trial_zones [curr_zone].k = k;
+                    trial_zones [curr_zone].start_code = zone_start_code;
+                    trial_zones [curr_zone].num_codes = 1UL << k;
+                    trial_zones [curr_zone].hits = histogram [k];
+                    trial_bits = histogram [k] * (k + trial_num_zones + 1);
+                    trial_num_zones++;
+
+                    if (encoding_bits && trial_bits + 6 >= encoding_bits)
+                        continue;
+
+                    if (histogram [k] < samples_left)
+                        trial_bits += best_next_zone_bits (samples, sample_count, trial_zones, &trial_num_zones, max_num_zones);
+                    else
+                        trial_bits += zone_overhead_bits (trial_zones, trial_num_zones);
+
+                    if (!encoding_bits || trial_bits < encoding_bits) {
+                        memcpy (zones, trial_zones, sizeof (Zone) * trial_num_zones);
+                        best_num_zones = trial_num_zones;
+                        encoding_bits = trial_bits;
+                    }
+                }
+
+                *num_zones = best_num_zones;
+                break;
+            }
+    }
+    else {
+        int best_k = -1;
+
+        for (int trial_k = 0; ; trial_k++) {
+            int trial_bits = 0;
+
+            for (int i = 0; i < sample_count; ++i)
+                if (samples [i] >= zone_start_code &&
+                    (trial_bits += (samples [i] - zone_start_code) >> trial_k) > sample_count * 32)
+                        break;
+
+            if (trial_bits > sample_count * 32)
+                continue;
+
+            zones [curr_zone].k = trial_k;
+            trial_bits += samples_left * (curr_zone + trial_k + 1);
+            trial_bits += zone_overhead_bits (zones, curr_zone + 1);
+
+            if (!encoding_bits || trial_bits < encoding_bits) {
+                encoding_bits = trial_bits;
+                best_k = trial_k;
+            }
+            else if (trial_k > k_prev)
+                break;
+        }
+
+        if (best_k < 0) {
+            fprintf (stderr, "best_next_zone_bits() termination test didn't get a best_k value\n");
+            exit (1);
+        }
+
+        zones [curr_zone].k = best_k;
+        zones [curr_zone].start_code = zone_start_code;
+        zones [curr_zone].num_codes = 1UL << best_k;
+        zones [curr_zone].hits = samples_left;
+        (*num_zones)++;
+    }
+
+    return encoding_bits;
 }
 
 // Scan sample array for redundant LSB's (zeros) and remove them through a
@@ -441,6 +735,9 @@ void dump_compression_stats (FILE *file)
     for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), i ? " %ld" : " (%ld)", (long) rice_ks [i]);
     fprintf (file, "rice-k:%s (max = %d)\n", string, maxnz - 1);
 
+    fprintf (file, "k-zones: (%d) %d %d %d %d %d %d %d %d\n",
+        k_zones [0], k_zones [1], k_zones [2], k_zones [3], k_zones [4], k_zones [5], k_zones [6], k_zones [7], k_zones [8]);
+
     for (i = 0; i < 32; ++i) if (shifts [i]) maxnz = i;
     if (maxnz) {
         for (string [0] = i = 0; i <= maxnz; ++i) sprintf (string + strlen(string), " %ld", (long) shifts [i]);
@@ -454,7 +751,7 @@ void dump_compression_stats (FILE *file)
 
 /****************************** DECOMPRESSION ********************************/
 
-static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int k_zones);
 static void leftshift_bits (int32_t *audio_samples, int sample_count, int stride, int shift);
 static void ms_to_lr (int32_t *audio_samples, int sample_count);
 static void dm_to_lr (int32_t *audio_samples, int sample_count);
@@ -471,7 +768,7 @@ static void ls_to_lr (int32_t *audio_samples, int sample_count);
 
 int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_chans, char *inbuffer, int inbufsize)
 {
-    int read_chans = num_chans, res = 0, stereo_mode, chan;
+    int read_chans = num_chans, res = 0, stereo_mode, k_zones, chan;
     Bitstream bs;
 
     // open the passed buffer as a bitstream and get the first 3 bits (stereo mode)
@@ -480,8 +777,10 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
     getbits (&stereo_mode, 3, &bs);
     stereo_mode &= STEREO_MODE;
 
-    if (stereo_mode == DUAL_MONO)   // for dual-mono, we only read one channel of data from the bitstream
+    if (stereo_mode == DUAL_MONO)       // for dual-mono, we only read one channel of data from the bitstream
         read_chans = 1;
+
+    k_zones = getbit (&bs);             // indicates whether more than a single k-zone might be present
 
     for (chan = 0; chan < read_chans; ++chan) {
         int shift = 0, decorr;
@@ -493,11 +792,11 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
         // as with encoding, we read the first few still correlated samples in a separate Rice operation
 
         if (decorr && abs (decorr) < sample_count) {
-            entropy_decode (&bs, audio_samples + chan, abs (decorr), num_chans);
-            entropy_decode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans);
+            entropy_decode (&bs, audio_samples + chan, abs (decorr), num_chans, k_zones);
+            entropy_decode (&bs, audio_samples + abs (decorr) * num_chans + chan, sample_count - abs (decorr), num_chans, k_zones);
         }
         else
-            entropy_decode (&bs, audio_samples + chan, sample_count, num_chans);
+            entropy_decode (&bs, audio_samples + chan, sample_count, num_chans, k_zones);
 
         // next undo the decorrelation step(s) in the reverse order they were applied
 
@@ -547,7 +846,18 @@ int decompress_audio_block (int32_t *audio_samples, int sample_count, int num_ch
 // of the desired channel. The first 5 bits are the Rice "k" value (offset 1)
 // which specifies how many bits are sent literally, with 0 signalling silence.
 
-static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+static void entropy_decode_simple (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+static void entropy_decode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride);
+
+static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride, int k_zones)
+{
+    if (sample_count < 64 || !k_zones)
+        entropy_decode_simple (bs, audio_samples, sample_count, stride);
+    else
+        entropy_decode_zones (bs, audio_samples, sample_count, stride);
+}
+
+static void entropy_decode_simple (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
 {
     int rice_k;
 
@@ -579,6 +889,74 @@ static void entropy_decode (Bitstream *bs, int32_t *audio_samples, int sample_co
             *audio_samples = non_negative_to_signed (avalue);
             audio_samples += stride;
         }
+    }
+}
+
+static void entropy_decode_zones (Bitstream *bs, int32_t *audio_samples, int sample_count, int stride)
+{
+    Zone zones [MAX_K_ZONES];
+
+    getbits (&zones [0].k, 5, bs);
+    zones [0].k = (zones [0].k & 0x1f) - 1;
+
+    if (zones [0].k < 0) {              // if silence, just clear the samples and get out
+        while (sample_count--) {
+            *audio_samples = 0;
+            audio_samples += stride;
+        }
+
+        return;
+    }
+
+    for (int z = 1; z < MAX_K_ZONES; ++z) {
+        int ones = 0, prev_k = zones [z - 1].k;
+
+        while (getbit (bs))
+            ones++;
+
+        if (!ones) {
+            if (!getbit (bs)) {
+                for (int j = z; j < MAX_K_ZONES; ++j)     // "00" = done
+                    zones [j].k = prev_k;
+
+                break;
+            }
+        }
+
+        zones [z].k = prev_k + non_negative_to_signed (ones);
+
+        if (zones [z].k < 0) {
+            fprintf (stderr, "zone decoding error at zone %d\n", z);
+            exit (1);
+        }
+    }
+
+    uint32_t start_code = 0;
+
+    for (int z = 0; z < MAX_K_ZONES; ++z) {
+        zones [z].num_codes = 1UL << zones [z].k;
+        zones [z].start_code = start_code;
+        zones [z].mask = zones [z].num_codes - 1;
+        start_code += zones [z].num_codes;
+    }
+
+    while (sample_count--) {
+        uint32_t avalue, rice_k_bits;
+
+        getcount (&avalue, bs);
+
+        if (avalue < MAX_K_ZONES) {
+            getbits (&rice_k_bits, zones [avalue].k, bs);
+            avalue = zones [avalue].start_code + (rice_k_bits & zones [avalue].mask);
+        }
+        else {
+            avalue = ((avalue - MAX_K_ZONES + 1) << zones [MAX_K_ZONES - 1].k) + zones [MAX_K_ZONES - 1].start_code;
+            getbits (&rice_k_bits, zones [MAX_K_ZONES - 1].k, bs);
+            avalue += rice_k_bits & zones [MAX_K_ZONES - 1].mask;
+        }
+
+        *audio_samples = non_negative_to_signed (avalue);
+        audio_samples += stride;
     }
 }
 

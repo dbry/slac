@@ -22,13 +22,16 @@
 
 // "flags" assignments ("or" together)
 
-#define STEREO_MODE 0x7
-#define MONO_MODE   0
-#define DUAL_MONO   1   // don't set this mode, will be detected automatically
-#define MID_SIDE    2   // stereo coding modes from best to worst, generally
-#define LEFT_RIGHT  3
-#define RIGHT_SIDE  4
-#define LEFT_SIDE   5
+#define STEREO_MODE     0x7
+#define MONO_MODE       0   // don't set this mode, it's detected automatically
+#define DUAL_MONO       1   // don't set this mode, it's detected automatically
+#define MID_SIDE        2   // stereo coding modes from best to worst, generally
+#define LEFT_RIGHT      3
+#define RIGHT_SIDE      4
+#define LEFT_SIDE       5
+
+#define EXTRA_K_SHIFT   4
+#define EXTRA_K_MASK    (0x7<<EXTRA_K_SHIFT)
 
 #ifdef __cplusplus
 extern "C" {
